@@ -469,6 +469,131 @@ pub struct HubExtensionWithStatus {
 // G. Resolved contribution types (post-processing output)
 // ---------------------------------------------------------------------------
 
+/// Resolved ACP adapter (after env template resolution).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedAcpAdapter {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cli_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acp_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_streaming: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_key_fields: Vec<serde_json::Value>,
+}
+
+/// Resolved MCP server (after env template resolution).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedMcpServer {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(flatten)]
+    pub config: serde_json::Value,
+}
+
+/// Resolved assistant (after @file: and env template resolution).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedAssistant {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+/// Resolved agent (after @file: and env template resolution).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedAgent {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// Resolved skill contributed by an extension.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedSkill {
+    pub extension_name: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Resolved theme (CSS content loaded into memory).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedTheme {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub css_content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_image: Option<String>,
+}
+
+/// Resolved channel plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedChannelPlugin {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<String>,
+}
+
 /// Resolved WebUI contribution (after route validation).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -492,6 +617,45 @@ pub struct ResolvedSettingsTab {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<SettingsTabPosition>,
+}
+
+/// Resolved model provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedModelProvider {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// H. Resolved contributions container
+// ---------------------------------------------------------------------------
+
+/// All resolved contributions from enabled extensions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedContributions {
+    pub acp_adapters: Vec<ResolvedAcpAdapter>,
+    pub mcp_servers: Vec<ResolvedMcpServer>,
+    pub assistants: Vec<ResolvedAssistant>,
+    pub agents: Vec<ResolvedAgent>,
+    pub skills: Vec<ResolvedSkill>,
+    pub themes: Vec<ResolvedTheme>,
+    pub channel_plugins: Vec<ResolvedChannelPlugin>,
+    pub webui: Vec<WebuiContribution>,
+    pub settings_tabs: Vec<ResolvedSettingsTab>,
+    pub model_providers: Vec<ResolvedModelProvider>,
+    /// i18n data keyed by extension name, then by message key.
+    pub i18n: HashMap<String, HashMap<String, String>>,
 }
 
 #[cfg(test)]

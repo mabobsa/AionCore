@@ -35,6 +35,24 @@ pub enum ExtensionError {
         supported: String,
     },
 
+    #[error("WebUI route '{route}' must be under '/{extension_name}/' namespace")]
+    InvalidWebuiRouteNamespace {
+        extension_name: String,
+        route: String,
+    },
+
+    #[error("WebUI route '{route}' uses reserved prefix '{prefix}'")]
+    ReservedWebuiRoute { route: String, prefix: String },
+
+    #[error("Theme CSS file not found: {0}")]
+    ThemeCssNotFound(String),
+
+    #[error("Contribution resolution failed for '{extension_name}': {reason}")]
+    ResolutionFailed {
+        extension_name: String,
+        reason: String,
+    },
+
     #[error("State persistence failed: {0}")]
     StatePersistence(String),
 
@@ -64,6 +82,14 @@ impl From<ExtensionError> for AppError {
             ExtensionError::ApiVersionIncompatible { .. } => {
                 AppError::BadRequest(err.to_string())
             }
+            ExtensionError::InvalidWebuiRouteNamespace { .. } => {
+                AppError::BadRequest(err.to_string())
+            }
+            ExtensionError::ReservedWebuiRoute { .. } => AppError::BadRequest(err.to_string()),
+            ExtensionError::ThemeCssNotFound(path) => {
+                AppError::NotFound(format!("Theme CSS not found: {path}"))
+            }
+            ExtensionError::ResolutionFailed { .. } => AppError::Internal(err.to_string()),
             ExtensionError::StatePersistence(msg) => AppError::Internal(msg),
             ExtensionError::Io(e) => AppError::Internal(e.to_string()),
             ExtensionError::JsonParse(e) => AppError::BadRequest(e.to_string()),
