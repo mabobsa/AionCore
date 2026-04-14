@@ -171,6 +171,35 @@ pub enum FileChangeOperation {
     Delete,
 }
 
+/// AI Agent CLI source identifier for MCP configuration sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpSource {
+    Claude,
+    Gemini,
+    Qwen,
+    #[serde(rename = "iflow")]
+    IFlow,
+    Codex,
+    #[serde(rename = "codebuddy")]
+    CodeBuddy,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Aionrs,
+    Nanobot,
+    Aionui,
+}
+
+/// MCP server connection status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpServerStatus {
+    Connected,
+    Disconnected,
+    Error,
+    Testing,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +253,44 @@ mod tests {
             let json = serde_json::to_string(&op).unwrap();
             let parsed: FileChangeOperation = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, op);
+        }
+    }
+
+    #[test]
+    fn test_mcp_source_serde_roundtrip() {
+        let cases = [
+            (McpSource::Claude, r#""claude""#),
+            (McpSource::Gemini, r#""gemini""#),
+            (McpSource::Qwen, r#""qwen""#),
+            (McpSource::IFlow, r#""iflow""#),
+            (McpSource::Codex, r#""codex""#),
+            (McpSource::CodeBuddy, r#""codebuddy""#),
+            (McpSource::OpenCode, r#""opencode""#),
+            (McpSource::Aionrs, r#""aionrs""#),
+            (McpSource::Nanobot, r#""nanobot""#),
+            (McpSource::Aionui, r#""aionui""#),
+        ];
+        for (variant, expected_json) in cases {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_json, "serialize {variant:?}");
+            let parsed: McpSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant, "deserialize {expected_json}");
+        }
+    }
+
+    #[test]
+    fn test_mcp_server_status_serde_roundtrip() {
+        let cases = [
+            (McpServerStatus::Connected, r#""connected""#),
+            (McpServerStatus::Disconnected, r#""disconnected""#),
+            (McpServerStatus::Error, r#""error""#),
+            (McpServerStatus::Testing, r#""testing""#),
+        ];
+        for (variant, expected_json) in cases {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_json, "serialize {variant:?}");
+            let parsed: McpServerStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant, "deserialize {expected_json}");
         }
     }
 }
