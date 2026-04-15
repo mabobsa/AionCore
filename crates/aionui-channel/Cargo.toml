@@ -6,8 +6,8 @@ edition.workspace = true
 [features]
 default = ["telegram"]
 telegram = ["dep:reqwest"]
-lark = ["dep:reqwest"]
-dingtalk = ["dep:reqwest", "dep:tokio-tungstenite"]
+lark = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
+dingtalk = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
 weixin = ["dep:reqwest"]
 
 [dependencies]
@@ -27,3 +27,4 @@ getrandom.workspace = true
 dashmap.workspace = true
 reqwest = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
