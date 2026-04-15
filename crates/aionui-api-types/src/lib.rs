@@ -1,5 +1,6 @@
 mod acp;
 mod auth;
+mod channel;
 mod confirmation;
 mod connection_test;
 mod conversation;
@@ -85,4 +86,11 @@ pub use skill::{
     ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
     RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
     SkillListItemResponse, SkillPathsResponse, WriteAssistantRuleRequest,
+};
+pub use channel::{
+    ApprovePairingRequest, BridgeResponse, ChannelAgentConfig, ChannelModelConfig,
+    ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest, EnablePluginRequest,
+    PairingRequestResponse, PairingRequestedPayload, PluginStatusChangedPayload,
+    PluginStatusResponse, RejectPairingRequest, RevokeUserRequest, SyncChannelSettingsRequest,
+    TestPluginExtraConfig, TestPluginRequest, TestPluginResponse, UserAuthorizedPayload,
 };
