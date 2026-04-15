@@ -338,9 +338,10 @@ async fn handle_callback_query(
     confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
     let data = cb.data.as_deref().unwrap_or("");
+    let parsed = parse_callback_data(data);
 
     // Check if this is a tool confirmation callback (system.confirm:callId=X,value=Y)
-    if let Some(action) = parse_callback_data(data)
+    if let Some(action) = &parsed
         && action.action == "system.confirm"
         && let Some(params) = &action.params
     {
@@ -366,8 +367,7 @@ async fn handle_callback_query(
         avatar_url: None,
     };
 
-    let action = parse_callback_data(data);
-    let unified_action = action.map(|a| UnifiedAction {
+    let unified_action = parsed.map(|a| UnifiedAction {
         action: a.action,
         category: a.category,
         params: a.params,
@@ -458,6 +458,9 @@ async fn handle_message(
 fn extract_content(
     msg: &TgMessage,
 ) -> (MessageContentType, String, Option<Vec<UnifiedAttachment>>) {
+    // For media messages, Telegram puts text in `caption` (not `text`).
+    let caption = msg.caption.clone().unwrap_or_default();
+
     // Photo — pick the largest resolution
     if let Some(photos) = &msg.photo {
         let best = photos.iter().max_by_key(|p| p.width * p.height);
@@ -470,8 +473,7 @@ fn extract_content(
                 url: None,
             }]
         });
-        let text = msg.text.clone().unwrap_or_default();
-        return (MessageContentType::Photo, text, attachments);
+        return (MessageContentType::Photo, caption, attachments);
     }
 
     // Document
@@ -483,8 +485,7 @@ fn extract_content(
             file_size: doc.file_size,
             url: None,
         }];
-        let text = msg.text.clone().unwrap_or_default();
-        return (MessageContentType::Document, text, Some(attachments));
+        return (MessageContentType::Document, caption, Some(attachments));
     }
 
     // Voice
@@ -496,7 +497,7 @@ fn extract_content(
             file_size: voice.file_size,
             url: None,
         }];
-        return (MessageContentType::Voice, String::new(), Some(attachments));
+        return (MessageContentType::Voice, caption, Some(attachments));
     }
 
     // Audio
@@ -508,7 +509,7 @@ fn extract_content(
             file_size: audio.file_size,
             url: None,
         }];
-        return (MessageContentType::Audio, String::new(), Some(attachments));
+        return (MessageContentType::Audio, caption, Some(attachments));
     }
 
     // Video
@@ -520,7 +521,7 @@ fn extract_content(
             file_size: video.file_size,
             url: None,
         }];
-        return (MessageContentType::Video, String::new(), Some(attachments));
+        return (MessageContentType::Video, caption, Some(attachments));
     }
 
     // Sticker
@@ -656,17 +657,36 @@ fn build_keyboard_markup(msg: &UnifiedOutgoingMessage) -> Option<ReplyMarkup> {
     }))
 }
 
-/// Encode an ActionButton into callback_data format: `"action"` or `"action:k=v,k=v"`.
+/// Derive the category prefix from an action name.
+///
+/// The mapping follows the `ActionCategory` routing in `ActionExecutor`:
+///   - `pairing.*` → `"platform"`
+///   - `chat.*` / `action.*` → `"chat"`
+///   - everything else (`session.*`, `help.*`, `settings.*`, `agent.*`, `system.*`) → `"system"`
+fn action_category_prefix(action: &str) -> &'static str {
+    let prefix = action.split('.').next().unwrap_or("");
+    match prefix {
+        "pairing" => "platform",
+        "chat" | "action" => "chat",
+        _ => "system",
+    }
+}
+
+/// Encode an ActionButton into callback_data format:
+/// `"category:action"` or `"category:action:k=v,k=v"`.
+///
+/// This is the inverse of [`parse_callback_data`].
 fn format_callback_data(btn: &ActionButton) -> String {
+    let category = action_category_prefix(&btn.action);
     match &btn.params {
         Some(params) if !params.is_empty() => {
             let encoded: Vec<String> = params
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
-            format!("{}:{}", btn.action, encoded.join(","))
+            format!("{category}:{}:{}", btn.action, encoded.join(","))
         }
-        _ => btn.action.clone(),
+        _ => format!("{category}:{}", btn.action),
     }
 }
 
@@ -831,7 +851,7 @@ mod tests {
             action: "help.show".into(),
             params: None,
         };
-        assert_eq!(format_callback_data(&btn), "help.show");
+        assert_eq!(format_callback_data(&btn), "system:help.show");
     }
 
     #[test]
@@ -844,8 +864,105 @@ mod tests {
             params: Some(params),
         };
         let result = format_callback_data(&btn);
-        assert!(result.starts_with("agent.select:"));
+        assert!(result.starts_with("system:agent.select:"));
         assert!(result.contains("agentType=gemini"));
+    }
+
+    #[test]
+    fn format_callback_chat_category() {
+        let btn = ActionButton {
+            label: "Regen".into(),
+            action: "chat.regenerate".into(),
+            params: None,
+        };
+        assert_eq!(format_callback_data(&btn), "chat:chat.regenerate");
+    }
+
+    #[test]
+    fn format_callback_platform_category() {
+        let btn = ActionButton {
+            label: "Pair".into(),
+            action: "pairing.show".into(),
+            params: None,
+        };
+        assert_eq!(format_callback_data(&btn), "platform:pairing.show");
+    }
+
+    // -- action_category_prefix ------------------------------------------------
+
+    #[test]
+    fn category_prefix_mapping() {
+        assert_eq!(action_category_prefix("pairing.show"), "platform");
+        assert_eq!(action_category_prefix("pairing.refresh"), "platform");
+        assert_eq!(action_category_prefix("chat.send"), "chat");
+        assert_eq!(action_category_prefix("chat.regenerate"), "chat");
+        assert_eq!(action_category_prefix("action.copy"), "chat");
+        assert_eq!(action_category_prefix("session.new"), "system");
+        assert_eq!(action_category_prefix("help.show"), "system");
+        assert_eq!(action_category_prefix("agent.select"), "system");
+        assert_eq!(action_category_prefix("system.confirm"), "system");
+        assert_eq!(action_category_prefix("settings.show"), "system");
+    }
+
+    // -- roundtrip format ↔ parse ----------------------------------------------
+
+    #[test]
+    fn roundtrip_no_params() {
+        let btn = ActionButton {
+            label: "Help".into(),
+            action: "help.show".into(),
+            params: None,
+        };
+        let encoded = format_callback_data(&btn);
+        let parsed = parse_callback_data(&encoded).expect("should parse");
+        assert_eq!(parsed.category, ActionCategory::System);
+        assert_eq!(parsed.action, "help.show");
+        assert!(parsed.params.is_none());
+    }
+
+    #[test]
+    fn roundtrip_with_params() {
+        let btn = ActionButton {
+            label: "Confirm".into(),
+            action: "system.confirm".into(),
+            params: Some(HashMap::from([
+                ("callId".into(), "abc123".into()),
+                ("value".into(), "yes".into()),
+            ])),
+        };
+        let encoded = format_callback_data(&btn);
+        let parsed = parse_callback_data(&encoded).expect("should parse");
+        assert_eq!(parsed.category, ActionCategory::System);
+        assert_eq!(parsed.action, "system.confirm");
+        let params = parsed.params.expect("should have params");
+        assert_eq!(params.get("callId").unwrap(), "abc123");
+        assert_eq!(params.get("value").unwrap(), "yes");
+    }
+
+    #[test]
+    fn roundtrip_chat_action() {
+        let btn = ActionButton {
+            label: "Regen".into(),
+            action: "chat.regenerate".into(),
+            params: None,
+        };
+        let encoded = format_callback_data(&btn);
+        let parsed = parse_callback_data(&encoded).expect("should parse");
+        assert_eq!(parsed.category, ActionCategory::Chat);
+        assert_eq!(parsed.action, "chat.regenerate");
+    }
+
+    #[test]
+    fn roundtrip_platform_action() {
+        let btn = ActionButton {
+            label: "Refresh".into(),
+            action: "pairing.refresh".into(),
+            params: None,
+        };
+        let encoded = format_callback_data(&btn);
+        let parsed = parse_callback_data(&encoded).expect("should parse");
+        assert_eq!(parsed.category, ActionCategory::Platform);
+        assert_eq!(parsed.action, "pairing.refresh");
     }
 
     // -- format_parse_mode --------------------------------------------------
@@ -1020,6 +1137,53 @@ mod tests {
         assert!(attachments.is_some());
     }
 
+    #[test]
+    fn extract_photo_caption() {
+        use super::super::types::TgPhotoSize;
+        let msg = make_tg_message_with_caption(
+            None,
+            Some("Check this out"),
+            Some(vec![TgPhotoSize {
+                file_id: "p1".into(),
+                file_unique_id: "u1".into(),
+                width: 100,
+                height: 100,
+                file_size: None,
+            }]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let (content_type, text, _) = extract_content(&msg);
+        assert_eq!(content_type, MessageContentType::Photo);
+        assert_eq!(text, "Check this out");
+    }
+
+    #[test]
+    fn extract_document_caption() {
+        use super::super::types::TgDocument;
+        let msg = make_tg_message_with_caption(
+            None,
+            Some("My report"),
+            None,
+            Some(TgDocument {
+                file_id: "d1".into(),
+                file_name: Some("report.pdf".into()),
+                mime_type: Some("application/pdf".into()),
+                file_size: Some(2048),
+            }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (content_type, text, _) = extract_content(&msg);
+        assert_eq!(content_type, MessageContentType::Document);
+        assert_eq!(text, "My report");
+    }
+
     // -- backoff_delay ------------------------------------------------------
 
     #[test]
@@ -1060,6 +1224,19 @@ mod tests {
         video: Option<super::super::types::TgVideo>,
         sticker: Option<super::super::types::TgSticker>,
     ) -> TgMessage {
+        make_tg_message_with_caption(text, None, photo, document, voice, audio, video, sticker)
+    }
+
+    fn make_tg_message_with_caption(
+        text: Option<&str>,
+        caption: Option<&str>,
+        photo: Option<Vec<super::super::types::TgPhotoSize>>,
+        document: Option<super::super::types::TgDocument>,
+        voice: Option<super::super::types::TgVoice>,
+        audio: Option<super::super::types::TgAudio>,
+        video: Option<super::super::types::TgVideo>,
+        sticker: Option<super::super::types::TgSticker>,
+    ) -> TgMessage {
         use super::super::types::TgChat;
         TgMessage {
             message_id: 1,
@@ -1071,6 +1248,7 @@ mod tests {
             },
             date: 1700000000,
             text: text.map(String::from),
+            caption: caption.map(String::from),
             photo,
             document,
             voice,

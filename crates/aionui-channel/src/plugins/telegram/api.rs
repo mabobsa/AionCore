@@ -29,8 +29,6 @@ impl TelegramApi {
         }
     }
 
-
-
     /// `getMe` — returns the bot's user identity.
     pub async fn get_me(&self) -> Result<TgUser, ChannelError> {
         let url = format!("{}/getMe", self.base_url);

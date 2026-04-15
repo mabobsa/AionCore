@@ -50,6 +50,8 @@ pub(crate) struct TgMessage {
     pub chat: TgChat,
     pub date: i64,
     pub text: Option<String>,
+    /// Caption for media messages (photo, document, audio, video, voice).
+    pub caption: Option<String>,
     pub photo: Option<Vec<TgPhotoSize>>,
     pub document: Option<TgDocument>,
     pub voice: Option<TgVoice>,
