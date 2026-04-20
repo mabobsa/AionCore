@@ -118,6 +118,10 @@ impl OfficecliWatchManager {
                     OfficeError::Io(io) => {
                         OfficeError::StartFailed(format!("IO error: {io}"))
                     }
+                    OfficeError::Snapshot(m) => OfficeError::StartFailed(m.clone()),
+                    OfficeError::Json(e) => {
+                        OfficeError::StartFailed(format!("JSON error: {e}"))
+                    }
                 })
             }
         }

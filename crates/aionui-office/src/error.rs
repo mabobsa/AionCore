@@ -16,6 +16,12 @@ pub enum OfficeError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 impl From<OfficeError> for AppError {
@@ -34,6 +40,8 @@ impl From<OfficeError> for AppError {
                 AppError::Timeout(format!("port readiness timeout for {path}"))
             }
             OfficeError::Io(e) => AppError::Internal(format!("IO error: {e}")),
+            OfficeError::Snapshot(msg) => AppError::Internal(format!("snapshot error: {msg}")),
+            OfficeError::Json(e) => AppError::Internal(format!("JSON error: {e}")),
         }
     }
 }
