@@ -66,6 +66,7 @@ async fn make_mock_agent(
         preset_assistant_id: None,
         session_mode: None,
         cron_job_id: None,
+        custom_workspace: false,
     };
 
     let tmp_skills = tempfile::TempDir::new().unwrap();

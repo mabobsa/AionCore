@@ -72,6 +72,8 @@ pub struct AcpBuildExtra {
     /// Associated cron job ID.
     #[serde(default)]
     pub cron_job_id: Option<String>,
+    #[serde(default)]
+    pub custom_workspace: bool,
 }
 
 /// OpenClaw gateway configuration.

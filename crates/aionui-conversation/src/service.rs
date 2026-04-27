@@ -87,12 +87,12 @@ impl ConversationService {
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let mut extra = req.extra;
-        if extra
+        let user_provided_workspace = !extra
             .get("workspace")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .is_empty()
-        {
+            .is_empty();
+        if !user_provided_workspace {
             let agent_type_label = match req.r#type {
                 aionui_common::AgentType::Acp => {
                     let backend = extra.get("backend").and_then(|v| {
@@ -112,6 +112,12 @@ impl ConversationService {
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
+        }
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert(
+                "custom_workspace".to_owned(),
+                serde_json::Value::Bool(user_provided_workspace),
+            );
         }
 
         let row = aionui_db::models::ConversationRow {
