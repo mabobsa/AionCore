@@ -70,7 +70,11 @@ impl TeamSessionService {
                 }),
                 source: None,
                 channel_chat_id: None,
-                extra: serde_json::json!({ "teamId": team_id }),
+                extra: build_agent_extra(
+                    &team_id,
+                    &input.backend,
+                    input.custom_agent_id.as_deref(),
+                ),
             };
             let conv = self
                 .conversation_service
@@ -215,7 +219,11 @@ impl TeamSessionService {
             }),
             source: None,
             channel_chat_id: None,
-            extra: serde_json::json!({ "teamId": team_id }),
+            extra: build_agent_extra(
+                team_id,
+                &req.backend,
+                req.custom_agent_id.as_deref(),
+            ),
         };
         let conv = self
             .conversation_service
@@ -401,6 +409,27 @@ impl TeamSessionService {
     }
 }
 
+/// Build the extra JSON for a team agent's conversation.
+///
+/// Merges team membership (`teamId`) with the agent-identification fields
+/// that the factory needs (`agent_id`) so the agent registry can resolve
+/// the CLI command.  Mirrors the `extra` shape that single-chat frontends
+/// send directly in `POST /api/conversations`.
+fn build_agent_extra(
+    team_id: &str,
+    backend: &str,
+    custom_agent_id: Option<&str>,
+) -> serde_json::Value {
+    let mut extra = serde_json::json!({
+        "teamId": team_id,
+        "backend": backend,
+    });
+    if let Some(id) = custom_agent_id {
+        extra["agent_id"] = serde_json::Value::String(id.to_owned());
+    }
+    extra
+}
+
 fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     let quoted = format!("\"{backend}\"");
     serde_json::from_str::<AgentType>(&quoted)
@@ -431,5 +460,27 @@ mod tests {
             parse_agent_type("openclaw-gateway").unwrap(),
             AgentType::OpenclawGateway
         );
+    }
+
+    #[test]
+    fn build_agent_extra_includes_team_id_and_backend() {
+        let extra = build_agent_extra("team-1", "acp", None);
+        assert_eq!(extra["teamId"], "team-1");
+        assert_eq!(extra["backend"], "acp");
+        assert!(extra.get("agent_id").is_none());
+    }
+
+    #[test]
+    fn build_agent_extra_includes_agent_id_when_custom_agent_id_set() {
+        let extra = build_agent_extra("team-2", "acp", Some("registry-agent-x"));
+        assert_eq!(extra["teamId"], "team-2");
+        assert_eq!(extra["backend"], "acp");
+        assert_eq!(extra["agent_id"], "registry-agent-x");
+    }
+
+    #[test]
+    fn build_agent_extra_without_custom_agent_id_has_no_agent_id_key() {
+        let extra = build_agent_extra("t3", "nanobot", None);
+        assert!(extra.get("agent_id").is_none());
     }
 }
