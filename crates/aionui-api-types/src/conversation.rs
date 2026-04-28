@@ -46,6 +46,10 @@ pub struct SendMessageRequest {
     pub files: Vec<String>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
+    /// When true, the stored user message is hidden from API responses.
+    /// Used internally (e.g. team wake prompts) to suppress system messages.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 // ── Query types ────────────────────────────────────────────────────

@@ -755,7 +755,7 @@ impl ConversationService {
             content: serde_json::json!({ "content": req.content }).to_string(),
             position: Some("right".into()),
             status: Some("finish".into()),
-            hidden: false,
+            hidden: req.hidden,
             created_at: now_ms(),
         };
         self.repo.insert_message(&user_msg).await?;

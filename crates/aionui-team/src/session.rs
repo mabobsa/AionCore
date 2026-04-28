@@ -152,6 +152,7 @@ impl TeamSession {
             msg_id: generate_id(),
             files: vec![],
             inject_skills: vec![],
+            hidden: true,
         };
 
         let conv_service = self.conversation_service.clone();
