@@ -500,6 +500,33 @@ pub fn build_team_state(
 
 ---
 
+## 12.5 `remove_team` 级联 kill agent 进程（Wave 2 · 模块 D11.5）
+
+**文件**：`crates/aionui-team/src/service.rs`
+
+```rust
+impl TeamSessionService {
+    pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        // ...existing: stop_session + delete conversations + delete mailbox/tasks/team...
+
+        // 【新增】在 stop_session 之后、delete conversations 之前：
+        // 遍历 team.agents，对每个 agent 调 task_manager.kill
+        for agent in &team.agents {
+            let _ = self.task_manager.kill(
+                &agent.conversation_id,
+                Some(AgentKillReason::TeamDeleted),
+            );
+        }
+    }
+}
+```
+
+**前置**：`TeamSessionService` 已持有 `task_manager`（由 D9 注入）。
+
+**测试**：1 条集成测试——建 team → ensure_session → remove_team → 断言 `task_manager.active_count()` 减少对应数量。
+
+---
+
 ## 12. 冻结的跨模块调用矩阵
 
 | Wave | 模块 | 读（依赖） | 写（调用） |
