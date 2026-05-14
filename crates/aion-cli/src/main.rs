@@ -36,8 +36,8 @@ struct Cli {
 enum Commands {
     /// Start a chat session
     Chat {
-        /// Agent type
-        #[arg(long, default_value = "acp")]
+        /// Agent backend (claude/codex/codebuddy/cursor)
+        #[arg(long, default_value = "claude")]
         agent: String,
 
         /// Model override
@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
 
     let (agent, model) = match cli.command {
         Some(Commands::Chat { agent, model }) => (agent, model),
-        None => ("acp".to_string(), None),
+        None => ("claude".to_string(), None),
     };
 
     let config = CliConfig {

@@ -56,9 +56,11 @@ impl AionClient {
     pub async fn create_conversation(&self) -> Result<String> {
         let url = self.config.api_url("/api/conversations");
         let body = json!({
-            "type": self.config.agent_type,
+            "type": "acp",
             "source": "aionui",
-            "extra": {}
+            "extra": {
+                "backend": self.config.agent_type
+            }
         });
 
         let resp = self
