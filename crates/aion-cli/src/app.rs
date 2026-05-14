@@ -58,11 +58,11 @@ impl App {
             }
             ServerEvent::StreamText { content } => {
                 self.state = AppState::Streaming;
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == MessageRole::Assistant {
-                        last.content.push_str(&content);
-                        return;
-                    }
+                if let Some(last) = self.messages.last_mut()
+                    && last.role == MessageRole::Assistant
+                {
+                    last.content.push_str(&content);
+                    return;
                 }
                 self.messages.push(ChatMessage {
                     role: MessageRole::Assistant,

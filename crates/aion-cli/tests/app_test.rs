@@ -48,12 +48,16 @@ fn stream_text_appends_to_assistant_message() {
     let mut app = App::new("acp".to_string(), None);
     app.state = AppState::Sending;
 
-    app.handle_server_event(ServerEvent::StreamText { content: "Hello ".to_string() });
+    app.handle_server_event(ServerEvent::StreamText {
+        content: "Hello ".to_string(),
+    });
     assert_eq!(app.state, AppState::Streaming);
     assert_eq!(app.messages.len(), 1);
     assert_eq!(app.messages[0].content, "Hello ");
 
-    app.handle_server_event(ServerEvent::StreamText { content: "world".to_string() });
+    app.handle_server_event(ServerEvent::StreamText {
+        content: "world".to_string(),
+    });
     assert_eq!(app.messages.len(), 1);
     assert_eq!(app.messages[0].content, "Hello world");
 }
@@ -76,7 +80,9 @@ fn stream_error_adds_system_message() {
     let mut app = App::new("acp".to_string(), None);
     app.state = AppState::Streaming;
 
-    app.handle_server_event(ServerEvent::StreamError { message: "fail".to_string() });
+    app.handle_server_event(ServerEvent::StreamError {
+        message: "fail".to_string(),
+    });
     assert_eq!(app.state, AppState::Idle);
     assert_eq!(app.messages.last().unwrap().role, MessageRole::System);
     assert!(app.messages.last().unwrap().content.contains("fail"));

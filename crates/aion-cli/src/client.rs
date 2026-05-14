@@ -1,8 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -114,9 +114,7 @@ impl AionClient {
         let url = self.config.ws_url();
         info!("Connecting WebSocket to {url}");
 
-        let (ws_stream, _) = connect_async(&url)
-            .await
-            .context("WebSocket connection failed")?;
+        let (ws_stream, _) = connect_async(&url).await.context("WebSocket connection failed")?;
 
         info!("WebSocket connected");
         let _ = tx.send(ServerEvent::Connected);
@@ -127,10 +125,10 @@ impl AionClient {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        if let Some(event) = parse_ws_message(&text) {
-                            if tx.send(event).is_err() {
-                                break;
-                            }
+                        if let Some(event) = parse_ws_message(&text)
+                            && tx.send(event).is_err()
+                        {
+                            break;
                         }
                     }
                     Ok(Message::Close(_)) => {

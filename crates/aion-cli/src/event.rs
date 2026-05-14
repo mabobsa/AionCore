@@ -7,12 +7,13 @@ use tokio::sync::mpsc;
 pub fn spawn_terminal_event_reader() -> mpsc::UnboundedReceiver<Event> {
     let (tx, rx) = mpsc::unbounded_channel();
 
-    std::thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            if let Ok(ev) = event::read() {
-                if tx.send(ev).is_err() {
-                    break;
-                }
+    std::thread::spawn(move || {
+        loop {
+            if event::poll(Duration::from_millis(50)).unwrap_or(false)
+                && let Ok(ev) = event::read()
+                && tx.send(ev).is_err()
+            {
+                break;
             }
         }
     });

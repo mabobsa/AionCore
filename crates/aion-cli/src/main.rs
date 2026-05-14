@@ -74,10 +74,7 @@ async fn run_chat(config: CliConfig) -> Result<()> {
 
     // Connect WebSocket
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    client
-        .connect_ws(ws_tx)
-        .await
-        .context("Failed to connect to server")?;
+    client.connect_ws(ws_tx).await.context("Failed to connect to server")?;
 
     // Create conversation
     let conversation_id = client.create_conversation().await?;
@@ -128,12 +125,7 @@ async fn run_chat(config: CliConfig) -> Result<()> {
     result
 }
 
-async fn handle_terminal_event(
-    app: &mut App,
-    client: &AionClient,
-    conversation_id: &str,
-    event: Event,
-) {
+async fn handle_terminal_event(app: &mut App, client: &AionClient, conversation_id: &str, event: Event) {
     let Event::Key(KeyEvent { code, modifiers, .. }) = event else {
         return;
     };
@@ -149,12 +141,10 @@ async fn handle_terminal_event(
             if app.state != AppState::Idle {
                 return;
             }
-            if let Some(text) = app.submit_input() {
-                if let Err(e) = client.send_message(conversation_id, &text).await {
-                    app.handle_server_event(ServerEvent::StreamError {
-                        message: e.to_string(),
-                    });
-                }
+            if let Some(text) = app.submit_input()
+                && let Err(e) = client.send_message(conversation_id, &text).await
+            {
+                app.handle_server_event(ServerEvent::StreamError { message: e.to_string() });
             }
         }
         (KeyCode::Backspace, _) => {
