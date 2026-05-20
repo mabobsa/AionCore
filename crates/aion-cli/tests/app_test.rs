@@ -69,6 +69,8 @@ fn stream_finish_transitions_to_idle() {
     app.messages.push(ChatMessage {
         role: MessageRole::Assistant,
         content: "done".to_string(),
+        tool_call_id: None,
+        tool_status: None,
     });
 
     app.handle_server_event(ServerEvent::StreamFinish);

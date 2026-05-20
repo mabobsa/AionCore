@@ -2,6 +2,7 @@ mod app;
 mod client;
 mod config;
 mod event;
+mod markdown;
 mod ui;
 
 use std::io;
@@ -82,6 +83,7 @@ async fn run_chat(config: CliConfig) -> Result<()> {
     // Initialize app
     let mut app = App::new(config.agent_type.clone(), config.model.clone());
     app.conversation_id = Some(conversation_id.clone());
+    app.session_id = Some(conversation_id.clone());
     app.state = AppState::Idle;
 
     // Setup terminal
@@ -126,38 +128,61 @@ async fn run_chat(config: CliConfig) -> Result<()> {
 }
 
 async fn handle_terminal_event(app: &mut App, client: &AionClient, conversation_id: &str, event: Event) {
-    let Event::Key(KeyEvent { code, modifiers, .. }) = event else {
-        return;
-    };
-
-    match (code, modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-            app.clear_input();
-        }
-        (KeyCode::Enter, _) => {
-            if app.state != AppState::Idle {
-                return;
+    match event {
+        Event::Key(KeyEvent { code, modifiers, .. }) => match (code, modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.should_quit = true;
             }
-            if let Some(text) = app.submit_input()
-                && let Err(e) = client.send_message(conversation_id, &text).await
-            {
-                app.handle_server_event(ServerEvent::StreamError { message: e.to_string() });
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                app.clear_input();
             }
-        }
-        (KeyCode::Backspace, _) => {
-            app.delete_char();
-        }
-        (KeyCode::Left, _) => {
-            app.move_cursor_left();
-        }
-        (KeyCode::Right, _) => {
-            app.move_cursor_right();
-        }
-        (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-            app.insert_char(c);
+            (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                app.clear_messages();
+            }
+            (KeyCode::Esc, _) => {
+                app.request_cancel();
+            }
+            (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                app.insert_newline();
+            }
+            (KeyCode::Enter, _) => {
+                if app.state != AppState::Idle && app.state != AppState::Connecting {
+                    return;
+                }
+                if let Some(text) = app.submit_input()
+                    && let Err(e) = client.send_message(conversation_id, &text).await
+                {
+                    app.handle_server_event(ServerEvent::StreamError { message: e.to_string() });
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                app.delete_char();
+            }
+            (KeyCode::Left, _) => {
+                app.move_cursor_left();
+            }
+            (KeyCode::Right, _) => {
+                app.move_cursor_right();
+            }
+            (KeyCode::Up, _) if app.input.is_empty() => {
+                app.history_up();
+            }
+            (KeyCode::Down, _) if app.input.is_empty() || app.history_index.is_some() => {
+                app.history_down();
+            }
+            (KeyCode::PageUp, _) => {
+                app.scroll_up(10);
+            }
+            (KeyCode::PageDown, _) => {
+                app.scroll_down(10);
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                app.insert_char(c);
+            }
+            _ => {}
+        },
+        Event::Resize(_, _) => {
+            // ratatui handles resize automatically on next draw
         }
         _ => {}
     }
