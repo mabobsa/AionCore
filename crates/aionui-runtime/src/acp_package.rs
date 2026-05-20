@@ -38,29 +38,47 @@ pub fn is_installed(data_dir: &Path, spec: &AcpPackageSpec) -> bool {
 }
 
 /// Resolve the entry-point script path for a pre-installed package.
-/// Returns `None` if not installed.
+/// Reads the package's `package.json` to find the bin entry dynamically.
+/// Returns `None` if not installed or entry point cannot be resolved.
 pub fn entry_point(data_dir: &Path, spec: &AcpPackageSpec) -> Option<PathBuf> {
     if !is_installed(data_dir, spec) {
         return None;
     }
     let dir = package_dir(data_dir, spec);
-    // Standard entry: node_modules/{package}/dist/index.js
-    let entry = dir
-        .join("node_modules")
-        .join(&spec.package)
-        .join("dist")
-        .join("index.js");
-    if entry.is_file() {
-        return Some(entry);
+    let pkg_dir = dir.join("node_modules").join(&spec.package);
+    resolve_bin_entry(&pkg_dir)
+}
+
+/// Read a package's `package.json` and resolve its primary bin entry.
+/// Tries `bin` (object or string) first, then falls back to `main`.
+fn resolve_bin_entry(pkg_dir: &Path) -> Option<PathBuf> {
+    let pkg_json_path = pkg_dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let pkg: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Try bin field first (preferred for CLI packages)
+    if let Some(bin) = pkg.get("bin") {
+        let bin_path = match bin {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(map) => map.values().next().and_then(|v| v.as_str().map(String::from)),
+            _ => None,
+        };
+        if let Some(rel) = bin_path {
+            let abs = pkg_dir.join(&rel);
+            if abs.is_file() {
+                return Some(abs);
+            }
+        }
     }
-    // Fallback: look for bin entry in node_modules/.bin
-    let bin_entry = dir
-        .join("node_modules")
-        .join(".bin")
-        .join(spec.package.rsplit('/').next().unwrap_or(&spec.package));
-    if bin_entry.is_file() {
-        return Some(bin_entry);
+
+    // Fallback to main field
+    if let Some(main) = pkg.get("main").and_then(|v| v.as_str()) {
+        let abs = pkg_dir.join(main);
+        if abs.is_file() {
+            return Some(abs);
+        }
     }
+
     None
 }
 
@@ -113,16 +131,13 @@ pub async fn install(data_dir: &Path, spec: &AcpPackageSpec) -> Result<(), Insta
     }
 
     // Verify entry point exists before committing
-    let entry = tmp_dir
-        .join("node_modules")
-        .join(&spec.package)
-        .join("dist")
-        .join("index.js");
-    if !entry.is_file() {
+    let pkg_dir = tmp_dir.join("node_modules").join(&spec.package);
+    if resolve_bin_entry(&pkg_dir).is_none() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(InstallError::MissingEntry(format!(
-            "expected entry point not found: {}",
-            entry.display()
+            "expected entry point not found: {}/node_modules/{}/[bin|main]",
+            tmp_dir.display(),
+            spec.package
         )));
     }
 
@@ -333,23 +348,67 @@ mod tests {
     }
 
     #[test]
-    fn entry_point_returns_path_when_installed() {
+    fn entry_point_returns_path_via_bin_field() {
         let tmp = tempfile::TempDir::new().unwrap();
         let spec = AcpPackageSpec {
             package: "@agentclientprotocol/claude-agent-acp".into(),
             version: "0.33.1".into(),
         };
         let dir = package_dir(tmp.path(), &spec);
-        let entry_dir = dir
-            .join("node_modules")
-            .join("@agentclientprotocol/claude-agent-acp")
-            .join("dist");
+        let pkg_dir = dir.join("node_modules").join("@agentclientprotocol/claude-agent-acp");
+        let entry_dir = pkg_dir.join("dist");
         std::fs::create_dir_all(&entry_dir).unwrap();
         std::fs::write(entry_dir.join("index.js"), "// entry").unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"bin":{"claude-agent-acp":"dist/index.js"}}"#,
+        )
+        .unwrap();
         std::fs::write(dir.join(INSTALL_STAMP), "").unwrap();
 
         let result = entry_point(tmp.path(), &spec);
         assert_eq!(result, Some(entry_dir.join("index.js")));
+    }
+
+    #[test]
+    fn entry_point_returns_path_via_bin_string() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spec = AcpPackageSpec {
+            package: "@zed-industries/codex-acp".into(),
+            version: "0.14.0".into(),
+        };
+        let dir = package_dir(tmp.path(), &spec);
+        let pkg_dir = dir.join("node_modules").join("@zed-industries/codex-acp");
+        let bin_dir = pkg_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("codex-acp.js"), "// bin").unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"bin":{"codex-acp":"bin/codex-acp.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(INSTALL_STAMP), "").unwrap();
+
+        let result = entry_point(tmp.path(), &spec);
+        assert_eq!(result, Some(bin_dir.join("codex-acp.js")));
+    }
+
+    #[test]
+    fn entry_point_fallback_to_main() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spec = AcpPackageSpec {
+            package: "some-pkg".into(),
+            version: "1.0.0".into(),
+        };
+        let dir = package_dir(tmp.path(), &spec);
+        let pkg_dir = dir.join("node_modules").join("some-pkg");
+        std::fs::create_dir_all(pkg_dir.join("lib")).unwrap();
+        std::fs::write(pkg_dir.join("lib/index.js"), "// main").unwrap();
+        std::fs::write(pkg_dir.join("package.json"), r#"{"main":"lib/index.js"}"#).unwrap();
+        std::fs::write(dir.join(INSTALL_STAMP), "").unwrap();
+
+        let result = entry_point(tmp.path(), &spec);
+        assert_eq!(result, Some(pkg_dir.join("lib/index.js")));
     }
 
     #[test]
