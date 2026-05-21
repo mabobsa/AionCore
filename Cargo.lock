@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-static-file"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "aionui-common",
  "mime_guess",
