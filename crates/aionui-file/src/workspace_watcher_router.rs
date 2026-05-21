@@ -16,13 +16,19 @@ use crate::workspace_watcher_registry::SubscriptionRegistry;
 #[derive(Debug, Deserialize)]
 struct SubscribePayload {
     workspace: String,
+    #[serde(default)]
     dirs: Vec<String>,
+    #[serde(default)]
+    extensions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UnsubscribePayload {
     workspace: String,
+    #[serde(default)]
     dirs: Vec<String>,
+    #[serde(default)]
+    extensions: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -67,9 +73,20 @@ impl MessageRouter for WorkspaceWatchRouter {
                         return;
                     }
                 };
-                debug!(%conn_id, workspace = %payload.workspace, dirs = ?payload.dirs, "workspace.subscribe");
-                let is_first = self.registry.subscribe(conn_id, &payload.workspace, &payload.dirs);
-                if is_first {
+                debug!(%conn_id, workspace = %payload.workspace, dirs = ?payload.dirs, extensions = ?payload.extensions, "workspace.subscribe");
+
+                let mut triggered_first = false;
+                if !payload.dirs.is_empty() && self.registry.subscribe(conn_id, &payload.workspace, &payload.dirs) {
+                    triggered_first = true;
+                }
+                if !payload.extensions.is_empty()
+                    && self
+                        .registry
+                        .subscribe_extensions(conn_id, &payload.workspace, &payload.extensions)
+                {
+                    triggered_first = true;
+                }
+                if triggered_first {
                     self.lifecycle.start_workspace_watch(&payload.workspace);
                 }
             }
@@ -81,9 +98,20 @@ impl MessageRouter for WorkspaceWatchRouter {
                         return;
                     }
                 };
-                debug!(%conn_id, workspace = %payload.workspace, dirs = ?payload.dirs, "workspace.unsubscribe");
-                let is_last = self.registry.unsubscribe(conn_id, &payload.workspace, &payload.dirs);
-                if is_last {
+                debug!(%conn_id, workspace = %payload.workspace, dirs = ?payload.dirs, extensions = ?payload.extensions, "workspace.unsubscribe");
+
+                let mut triggered_last = false;
+                if !payload.dirs.is_empty() && self.registry.unsubscribe(conn_id, &payload.workspace, &payload.dirs) {
+                    triggered_last = true;
+                }
+                if !payload.extensions.is_empty()
+                    && self
+                        .registry
+                        .unsubscribe_extensions(conn_id, &payload.workspace, &payload.extensions)
+                {
+                    triggered_last = true;
+                }
+                if triggered_last {
                     self.lifecycle.stop_workspace_watch(&payload.workspace);
                 }
             }
@@ -207,5 +235,68 @@ mod tests {
     fn invalid_payload_does_not_panic() {
         let (router, _) = setup();
         router.route(ConnectionId(1), "workspace.subscribe", json!("invalid"));
+    }
+
+    #[test]
+    fn subscribe_extensions_triggers_start() {
+        let (router, lifecycle) = setup();
+        router.route(
+            ConnectionId(1),
+            "workspace.subscribe",
+            json!({"workspace": "/ws", "extensions": ["docx", "pptx"]}),
+        );
+        assert_eq!(lifecycle.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn subscribe_dirs_and_extensions_together() {
+        let (router, lifecycle) = setup();
+        router.route(
+            ConnectionId(1),
+            "workspace.subscribe",
+            json!({"workspace": "/ws", "dirs": ["src"], "extensions": ["docx"]}),
+        );
+        // Only one start call even though both dirs and extensions
+        assert_eq!(lifecycle.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unsubscribe_extensions_triggers_stop_when_last() {
+        let (router, lifecycle) = setup();
+        router.route(
+            ConnectionId(1),
+            "workspace.subscribe",
+            json!({"workspace": "/ws", "extensions": ["docx"]}),
+        );
+        router.route(
+            ConnectionId(1),
+            "workspace.unsubscribe",
+            json!({"workspace": "/ws", "extensions": ["docx"]}),
+        );
+        assert_eq!(lifecycle.stopped.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unsubscribe_extensions_does_not_stop_if_dirs_remain() {
+        let (router, lifecycle) = setup();
+        router.route(
+            ConnectionId(1),
+            "workspace.subscribe",
+            json!({"workspace": "/ws", "dirs": ["src"], "extensions": ["docx"]}),
+        );
+        router.route(
+            ConnectionId(1),
+            "workspace.unsubscribe",
+            json!({"workspace": "/ws", "extensions": ["docx"]}),
+        );
+        // dirs still subscribed, no stop
+        assert!(lifecycle.stopped.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn subscribe_with_empty_dirs_and_extensions_is_noop() {
+        let (router, lifecycle) = setup();
+        router.route(ConnectionId(1), "workspace.subscribe", json!({"workspace": "/ws"}));
+        assert!(lifecycle.started.lock().unwrap().is_empty());
     }
 }

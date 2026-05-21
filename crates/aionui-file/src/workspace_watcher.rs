@@ -1,7 +1,7 @@
 //! Workspace-level file watcher: shared OS watcher via notify-debouncer-full,
 //! gitignore filtering, event fan-out to workspace subscribers + office watch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use aionui_api_types::WebSocketMessage;
 use aionui_common::AppError;
-use aionui_realtime::WebSocketManager;
+use aionui_realtime::{ConnectionId, WebSocketManager};
 
 use crate::workspace_watcher_registry::SubscriptionRegistry;
 
@@ -266,12 +266,10 @@ impl EventDispatcher {
                     continue;
                 }
 
-                // Filter editor temp files (atomic save intermediates)
                 if is_temp_file(&relative) {
                     continue;
                 }
 
-                // Check if .gitignore itself changed
                 if relative == ".gitignore" {
                     self.gitignore.invalidate(&batch.workspace);
                     self.gitignore.rebuild(&batch.workspace);
@@ -282,7 +280,7 @@ impl EventDispatcher {
                     continue;
                 }
 
-                // Office fan-out: Create events for office files
+                // Office fan-out (legacy, kept until frontend migrates to extensions)
                 if kind == WatchChangeKind::Create && is_office_file(path) {
                     self.emit_office_event(path, &batch.workspace);
                 }
@@ -295,18 +293,23 @@ impl EventDispatcher {
             return;
         }
 
-        // Group changes by parent directory and dispatch to subscribers
-        let mut per_dir: HashMap<String, Vec<WatchChange>> = HashMap::new();
-        for change in changes {
+        // Track which (conn, path) pairs have been sent via dirs to avoid duplicates
+        let mut sent: HashSet<(ConnectionId, usize)> = HashSet::new();
+
+        // --- Phase 1: dispatch by directory subscription (first-level rule) ---
+        let mut per_dir: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, change) in changes.iter().enumerate() {
             let parent = parent_dir(&change.path);
-            per_dir.entry(parent).or_default().push(change);
+            per_dir.entry(parent).or_default().push(idx);
         }
 
-        for (dir, dir_changes) in per_dir {
-            let subscribers = self.registry.get_subscribers_for_dir(&batch.workspace, &dir);
+        for (dir, indices) in &per_dir {
+            let subscribers = self.registry.get_subscribers_for_dir(&batch.workspace, dir);
             if subscribers.is_empty() {
                 continue;
             }
+
+            let dir_changes: Vec<WatchChange> = indices.iter().map(|&i| changes[i].clone()).collect();
 
             if dir_changes.len() > OVERFLOW_THRESHOLD {
                 let event = WatchOverflowEvent {
@@ -324,7 +327,41 @@ impl EventDispatcher {
                 let msg = WebSocketMessage::new("workspace.changed", serde_json::to_value(&event).unwrap_or_default());
                 for conn_id in &subscribers {
                     self.ws_manager.send_to(*conn_id, msg.clone());
+                    for &idx in indices {
+                        sent.insert((*conn_id, idx));
+                    }
                 }
+            }
+        }
+
+        // --- Phase 2: dispatch by extension subscription (full-recursive) ---
+        let mut ext_per_conn: HashMap<ConnectionId, Vec<&WatchChange>> = HashMap::new();
+
+        for (idx, change) in changes.iter().enumerate() {
+            if let Some(ext) = file_extension(&change.path) {
+                let subscribers = self.registry.get_subscribers_for_extension(&batch.workspace, &ext);
+                for conn_id in subscribers {
+                    if !sent.contains(&(conn_id, idx)) {
+                        ext_per_conn.entry(conn_id).or_default().push(change);
+                    }
+                }
+            }
+        }
+
+        for (conn_id, ext_changes) in ext_per_conn {
+            if ext_changes.len() > OVERFLOW_THRESHOLD {
+                let event = WatchOverflowEvent {
+                    workspace: batch.workspace.clone(),
+                };
+                let msg = WebSocketMessage::new("workspace.overflow", serde_json::to_value(&event).unwrap_or_default());
+                self.ws_manager.send_to(conn_id, msg);
+            } else {
+                let event = WatchBatchEvent {
+                    workspace: batch.workspace.clone(),
+                    changes: ext_changes.into_iter().cloned().collect(),
+                };
+                let msg = WebSocketMessage::new("workspace.changed", serde_json::to_value(&event).unwrap_or_default());
+                self.ws_manager.send_to(conn_id, msg);
             }
         }
     }
@@ -386,6 +423,14 @@ pub(crate) fn parent_dir(relative_path: &str) -> String {
         Some(p) => p.to_string_lossy().into_owned(),
         None => String::new(),
     }
+}
+
+/// Extract the file extension from a relative path (lowercase).
+fn file_extension(relative_path: &str) -> Option<String> {
+    Path::new(relative_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
 }
 
 // ---------------------------------------------------------------------------
