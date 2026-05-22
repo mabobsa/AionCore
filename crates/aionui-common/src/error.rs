@@ -43,6 +43,13 @@ pub enum AppError {
     /// bad-request banner.
     #[error("Conversation archived: {0}")]
     ConversationArchived(String),
+
+    /// Local environment cannot host the operation (disk full, directory not
+    /// writable, filesystem read-only). Distinct from `Internal` — the user
+    /// can act on this. Maps to 502 because a downstream gateway analogy
+    /// holds: we cannot reach the agent because of local infra.
+    #[error("Environment error: {0}")]
+    EnvironmentError(String),
 }
 
 /// Internal error response body matching the `ErrorResponse` format from `aionui-api-types`.
@@ -68,6 +75,7 @@ impl AppError {
             Self::Timeout(_) => StatusCode::BAD_GATEWAY,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ConversationArchived(_) => StatusCode::GONE,
+            Self::EnvironmentError(_) => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -91,6 +99,7 @@ impl AppError {
             Self::Timeout(_) => "TIMEOUT",
             Self::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
             Self::ConversationArchived(_) => "CONVERSATION_ARCHIVED",
+            Self::EnvironmentError(_) => "ENVIRONMENT_ERROR",
         }
     }
 }
@@ -234,5 +243,13 @@ mod tests {
             source: Inner,
         };
         assert_eq!(format!("{}", ErrorChain(&err)), "outer: boom: inner cause");
+    }
+
+    #[test]
+    fn environment_error_status_and_code() {
+        let err = AppError::EnvironmentError("disk full".into());
+        assert_eq!(err.status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(err.error_code(), "ENVIRONMENT_ERROR");
+        assert_eq!(err.to_string(), "Environment error: disk full");
     }
 }
