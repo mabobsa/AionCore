@@ -24,8 +24,7 @@ pub use types::{
 };
 pub use watch_service::FileWatchService;
 pub use workspace_watcher::{
-    EventDispatcher, GitignoreFilter, SharedWorkspaceWatcher, WatchBatchEvent, WatchChange, WatchChangeKind,
-    WatchOverflowEvent, WorkspaceWatchManager,
+    EventDispatcher, GitignoreFilter, SharedWorkspaceWatcher, WorkspaceWatchManager,
 };
 pub use workspace_watcher_registry::SubscriptionRegistry;
 pub use workspace_watcher_router::{WatcherLifecycle, WorkspaceWatchRouter};

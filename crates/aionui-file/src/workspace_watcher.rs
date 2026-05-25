@@ -8,48 +8,14 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{WatchBatchEvent, WatchChange, WatchChangeKind, WatchOverflowEvent, WebSocketMessage};
 use aionui_common::AppError;
 use aionui_realtime::{ConnectionId, WebSocketManager};
 
 use crate::workspace_watcher_registry::SubscriptionRegistry;
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/// Kind of file-system change detected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WatchChangeKind {
-    Create,
-    Modify,
-    Delete,
-}
-
-/// A single file-system change within a workspace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchChange {
-    pub path: String,
-    pub kind: WatchChangeKind,
-}
-
-/// Batch event pushed to subscribed connections.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchBatchEvent {
-    pub workspace: String,
-    pub changes: Vec<WatchChange>,
-}
-
-/// Overflow event when too many changes occur in a single batch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchOverflowEvent {
-    pub workspace: String,
-}
 
 // ---------------------------------------------------------------------------
 // Debounced event from notify-debouncer-full
