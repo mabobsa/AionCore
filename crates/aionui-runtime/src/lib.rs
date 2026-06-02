@@ -8,10 +8,16 @@
 mod cache;
 mod embed;
 mod extract;
+pub mod node_runtime;
 mod resolver;
 mod shell_env;
 
 pub use cache::init;
+pub use node_runtime::{
+    DoctorRow, NodeRuntimeError, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,
+    ResolvedNodeSource, RuntimeCommandProbe, doctor_snapshot, doctor_snapshot_for_test, ensure_node_runtime,
+    ensure_runtime_command, probe_node_runtime_supported, probe_runtime_command,
+};
 pub use resolver::{ResolveError, bun_bin_dir, resolve_bun, resolve_command_in, resolve_command_path};
 pub use shell_env::enhance_process_path;
 mod spawn;

@@ -16,7 +16,7 @@
 //! avoid materializing the builtin-skills tree as a side effect of a
 //! read-only diagnostic run.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use anyhow::Result;
 
 use aionui_ai_agent::{AgentRegistry, UnavailableReason};
 use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database, maybe_copy_legacy_database};
+use aionui_runtime::doctor_snapshot;
 
 use crate::cli::Cli;
 
@@ -57,10 +58,24 @@ fn print_environment(merged_path: &str, data_dir: &Path) {
     println!("  data-dir       : {}", data_dir.display());
     println!("  PATH segments  : {path_segments}");
     println!("  PATH length    : {}", merged_path.len());
-    if let Some(p) = std::env::var_os("AIONUI_BUN_PATH") {
-        println!("  AIONUI_BUN_PATH: {}", PathBuf::from(p).display());
+    for line in runtime_snapshot_lines() {
+        println!("{line}");
     }
     println!();
+}
+
+fn runtime_snapshot_lines() -> Vec<String> {
+    let rows = doctor_snapshot();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec!["  node runtime   :".to_owned()];
+    lines.extend(
+        rows.into_iter()
+            .map(|row| format!("    {:<4} {:<10} {}", row.tool, row.source, row.detail)),
+    );
+    lines
 }
 
 fn print_snapshot(snapshot: &[(aionui_api_types::AgentMetadata, Option<UnavailableReason>)]) {
@@ -110,5 +125,21 @@ fn describe_reason(reason: &UnavailableReason) -> String {
         UnavailableReason::BridgeMissing { bridge } => format!("bridge `{bridge}` not on $PATH"),
         UnavailableReason::PrimaryMissing { binary } => format!("CLI `{binary}` not on $PATH"),
         UnavailableReason::CommandMissing { command } => format!("`{command}` not on $PATH"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_snapshot_lines_have_header_and_rows() {
+        let lines = runtime_snapshot_lines();
+        if lines.is_empty() {
+            return;
+        }
+
+        assert_eq!(lines[0], "  node runtime   :");
+        assert!(lines.iter().skip(1).any(|line| line.contains("node")));
     }
 }

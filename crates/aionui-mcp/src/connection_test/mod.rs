@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use aionui_api_types::McpConnectionTestResult;
-use aionui_runtime::{Builder as CmdBuilder, kill_process_tree};
+use aionui_runtime::{Builder as CmdBuilder, ensure_runtime_command, kill_process_tree};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -81,7 +81,20 @@ impl McpConnectionTestService {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> McpConnectionTestResult {
-        let mut cmd = CmdBuilder::new(command);
+        let resolved = match ensure_runtime_command(command).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let message = error.to_string();
+                let io_error = if message.contains("not found") {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, message)
+                } else {
+                    std::io::Error::other(message)
+                };
+                return spawn_error_result(command, &io_error);
+            }
+        };
+
+        let mut cmd = CmdBuilder::from_resolved(&resolved);
         cmd.args(args)
             .envs(env.iter())
             .stdin(std::process::Stdio::piped())

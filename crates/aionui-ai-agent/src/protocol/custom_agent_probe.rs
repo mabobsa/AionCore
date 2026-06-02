@@ -13,12 +13,12 @@
 //! Both paths produce identical outcomes / error text.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use aionui_api_types::TryConnectCustomAgentResponse;
 use aionui_common::{CommandSpec, EnvVar};
-use aionui_runtime::resolve_command_path;
+use aionui_runtime::ensure_runtime_command;
 use tokio::sync::{broadcast, mpsc};
 use tracing::debug;
 
@@ -43,12 +43,15 @@ pub async fn try_connect_custom_agent(
 ) -> TryConnectCustomAgentResponse {
     // ── Step 1 — which check ────────────────────────────────────────
     let head = first_token(command);
-    let Some(resolved) = resolve_command_path(head) else {
-        return TryConnectCustomAgentResponse::FailCli {
-            error: format!("Command '{}' was not found on PATH", head),
-        };
+    let resolved = match ensure_runtime_command(head).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return TryConnectCustomAgentResponse::FailCli {
+                error: error.to_string(),
+            };
+        }
     };
-    debug!(?resolved, "probe step 1 ok");
+    debug!(program = %resolved.program.display(), "probe step 1 ok");
 
     // ── Step 2 — spawn + ACP initialize ─────────────────────────────
     match tokio::time::timeout(STEP2_TIMEOUT, acp_initialize(resolved, args, env, data_dir)).await {
@@ -65,21 +68,34 @@ fn first_token(command: &str) -> &str {
 }
 
 async fn acp_initialize(
-    resolved: PathBuf,
+    resolved: aionui_runtime::ResolvedCommand,
     args: &[String],
     env: &HashMap<String, String>,
     data_dir: &Path,
 ) -> Result<(), String> {
+    let mut final_args: Vec<String> = resolved
+        .args_prefix
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    final_args.extend(args.iter().cloned());
+
+    let mut final_env: Vec<EnvVar> = env
+        .iter()
+        .map(|(name, value)| EnvVar {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    final_env.extend(resolved.env.iter().map(|(name, value)| EnvVar {
+        name: name.to_string_lossy().into_owned(),
+        value: value.to_string_lossy().into_owned(),
+    }));
+
     let spec = CommandSpec {
-        command: resolved,
-        args: args.to_vec(),
-        env: env
-            .iter()
-            .map(|(name, value)| EnvVar {
-                name: name.clone(),
-                value: value.clone(),
-            })
-            .collect(),
+        command: resolved.program,
+        args: final_args,
+        env: final_env,
         cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
     };
 
