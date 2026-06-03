@@ -36,7 +36,7 @@ use aionui_realtime::{NoopMessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, ModelFetchService, ProtocolDetectionService,
-    ProviderService, SettingsService, SystemRouterState, VersionCheckService,
+    ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
 };
 use aionui_team::{TeamRouterState, TeamSessionService};
 
@@ -240,6 +240,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, env!("CARGO_PKG_VERSION").to_owned()),
+        runtime_prepare_service: RuntimePrepareService::new(services.event_bus.clone()),
     }
 }
 

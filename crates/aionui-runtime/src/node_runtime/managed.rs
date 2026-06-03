@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,7 +18,9 @@ use super::types::{
 const MANAGED_NODE_VERSION: &str = "24.11.0";
 const MANAGED_NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const MANAGED_NODE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const MANAGED_NODE_DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGED_NODE_DOWNLOAD_ATTEMPTS: usize = 2;
+const MANAGED_NODE_PROGRESS_STEP_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformSpec {
@@ -291,8 +293,12 @@ async fn install_archive(
 ) -> Result<(), NodeRuntimeError> {
     let url = spec.download_url();
     let version_dir = runtime_root.join(spec.directory_name());
+    let archive_path = archive_download_path(runtime_root, spec);
     if version_dir.exists() {
         let _ = fs::remove_dir_all(&version_dir);
+    }
+    if archive_path.exists() {
+        let _ = fs::remove_file(&archive_path);
     }
 
     emit_progress(
@@ -312,24 +318,22 @@ async fn install_archive(
     let response = response
         .error_for_status()
         .map_err(|error| reqwest_error("download archive", &url, &error))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| reqwest_error("read archive body", &url, &error))?;
+    stream_archive_to_file(response, &archive_path, &url, reporter).await?;
 
     emit_progress(
         reporter,
         NodeRuntimeProgress::extracting(format!("extracting managed Node runtime into {}", runtime_root.display())),
     );
     match spec.archive_ext {
-        "tar.gz" => extract_tar_gz(bytes.as_ref(), runtime_root)?,
-        "zip" => extract_zip(bytes.as_ref(), runtime_root)?,
+        "tar.gz" => extract_tar_gz(&archive_path, runtime_root)?,
+        "zip" => extract_zip(&archive_path, runtime_root)?,
         ext => {
             return Err(NodeRuntimeError::managed_invalid(format!(
                 "unsupported archive extension: {ext}"
             )));
         }
     }
+    let _ = fs::remove_file(&archive_path);
 
     Ok(())
 }
@@ -362,17 +366,60 @@ async fn install_archive_with_retry(
         .unwrap_or_else(|| NodeRuntimeError::managed_invalid("managed node runtime install failed")))
 }
 
-fn extract_tar_gz(bytes: &[u8], runtime_root: &Path) -> Result<(), NodeRuntimeError> {
-    let decoder = GzDecoder::new(Cursor::new(bytes));
+fn archive_download_path(runtime_root: &Path, spec: PlatformSpec) -> PathBuf {
+    runtime_root.join(format!("{}.download", spec.directory_name()))
+}
+
+async fn stream_archive_to_file(
+    mut response: reqwest::Response,
+    archive_path: &Path,
+    url: &str,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<(), NodeRuntimeError> {
+    let mut writer = fs::File::create(archive_path).map_err(NodeRuntimeError::io_system)?;
+    let total_bytes = response.content_length();
+    let mut downloaded_bytes = 0_u64;
+    let mut next_report_threshold = MANAGED_NODE_PROGRESS_STEP_BYTES;
+
+    loop {
+        let chunk = tokio::time::timeout(MANAGED_NODE_DOWNLOAD_IDLE_TIMEOUT, response.chunk())
+            .await
+            .map_err(|_| timeout_error("read archive body", url, MANAGED_NODE_DOWNLOAD_IDLE_TIMEOUT))?
+            .map_err(|error| reqwest_error("read archive body", url, &error))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+
+        writer.write_all(&chunk).map_err(NodeRuntimeError::io_system)?;
+        downloaded_bytes += chunk.len() as u64;
+
+        if downloaded_bytes == chunk.len() as u64 || downloaded_bytes >= next_report_threshold {
+            emit_progress(
+                reporter,
+                NodeRuntimeProgress::downloading(download_progress_message(url, downloaded_bytes, total_bytes)),
+            );
+            while downloaded_bytes >= next_report_threshold {
+                next_report_threshold += MANAGED_NODE_PROGRESS_STEP_BYTES;
+            }
+        }
+    }
+
+    writer.flush().map_err(NodeRuntimeError::io_system)?;
+    Ok(())
+}
+
+fn extract_tar_gz(archive_path: &Path, runtime_root: &Path) -> Result<(), NodeRuntimeError> {
+    let archive_file = fs::File::open(archive_path).map_err(NodeRuntimeError::io_system)?;
+    let decoder = GzDecoder::new(archive_file);
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(runtime_root)
         .map_err(|error| NodeRuntimeError::managed_invalid(format!("extract tar.gz failed: {error}")))
 }
 
-fn extract_zip(bytes: &[u8], runtime_root: &Path) -> Result<(), NodeRuntimeError> {
-    let cursor = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
+fn extract_zip(archive_path: &Path, runtime_root: &Path) -> Result<(), NodeRuntimeError> {
+    let archive_file = fs::File::open(archive_path).map_err(NodeRuntimeError::io_system)?;
+    let mut archive = zip::ZipArchive::new(archive_file)
         .map_err(|error| NodeRuntimeError::managed_invalid(format!("open zip failed: {error}")))?;
 
     for index in 0..archive.len() {
@@ -492,7 +539,7 @@ fn emit_progress(reporter: Option<&dyn NodeRuntimeProgressReporter>, update: Nod
 
 fn reqwest_error(stage: &str, url: &str, error: &reqwest::Error) -> NodeRuntimeError {
     if error.is_timeout() {
-        return timeout_error(stage, url);
+        return timeout_error(stage, url, MANAGED_NODE_DOWNLOAD_TIMEOUT);
     }
     if let Some(status) = error.status() {
         return http_status_error(stage, url, status);
@@ -503,11 +550,22 @@ fn reqwest_error(stage: &str, url: &str, error: &reqwest::Error) -> NodeRuntimeE
     NodeRuntimeError::managed_invalid(format!("{stage} failed for {url}: {error}"))
 }
 
-fn timeout_error(stage: &str, url: &str) -> NodeRuntimeError {
+fn timeout_error(stage: &str, url: &str, timeout: Duration) -> NodeRuntimeError {
     NodeRuntimeError::managed_invalid(format!(
         "{stage} timed out after {}s for {url}",
-        MANAGED_NODE_DOWNLOAD_TIMEOUT.as_secs()
+        timeout.as_secs()
     ))
+}
+
+fn download_progress_message(url: &str, downloaded_bytes: u64, total_bytes: Option<u64>) -> String {
+    let downloaded_mb = downloaded_bytes / (1024 * 1024);
+    match total_bytes {
+        Some(total) if total > 0 => {
+            let total_mb = total / (1024 * 1024);
+            format!("downloading managed Node runtime from {url} ({downloaded_mb}MB / {total_mb}MB)")
+        }
+        _ => format!("downloading managed Node runtime from {url} ({downloaded_mb}MB)"),
+    }
 }
 
 fn http_status_error(stage: &str, url: &str, status: reqwest::StatusCode) -> NodeRuntimeError {
@@ -627,7 +685,11 @@ mod tests {
 
     #[test]
     fn managed_runtime_timeout_error_is_explicit() {
-        let error = timeout_error("download archive", "https://example.com/node.tar.gz");
+        let error = timeout_error(
+            "download archive",
+            "https://example.com/node.tar.gz",
+            MANAGED_NODE_DOWNLOAD_TIMEOUT,
+        );
         let message = error.to_string();
         assert!(message.contains("download archive timed out"));
         assert!(message.contains("600s"));

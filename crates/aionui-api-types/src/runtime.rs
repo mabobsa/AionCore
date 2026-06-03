@@ -55,6 +55,16 @@ pub struct RuntimeStatusPayload {
     pub status_code: Option<u16>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureNodeRuntimeRequest {
+    pub scope: RuntimeStatusScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureNodeRuntimeResponse {
+    pub ready: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +88,20 @@ mod tests {
         assert_eq!(json["scope"]["kind"], "conversation");
         assert_eq!(json["phase"], "downloading");
         assert_eq!(json["message"], "downloading");
+    }
+
+    #[test]
+    fn ensure_node_runtime_request_roundtrips() {
+        let request = EnsureNodeRuntimeRequest {
+            scope: RuntimeStatusScope {
+                kind: RuntimeStatusScopeKind::Mcp,
+                id: "chrome-devtools".into(),
+            },
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["scope"]["kind"], "mcp");
+        let parsed: EnsureNodeRuntimeRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, request);
     }
 }

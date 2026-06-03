@@ -776,6 +776,8 @@ dependencies = [
  "aionui-auth",
  "aionui-common",
  "aionui-db",
+ "aionui-realtime",
+ "aionui-runtime",
  "async-trait",
  "aws-config",
  "aws-sdk-bedrock",
