@@ -12,8 +12,10 @@ use aionui_common::{AppError, CommandSpec};
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
-use aionui_runtime::ensure_runtime_command;
+use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
 use tracing::{debug, info, warn};
+
+use crate::runtime_status::conversation_runtime_reporter;
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -76,7 +78,8 @@ pub(super) async fn build(
         );
     }
 
-    let mut command_spec = resolve_agent_command_spec(&meta, &ctx.workspace).await?;
+    let mut command_spec =
+        resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
     if meta.backend.as_deref() == Some("claude") {
         let cc_switch_env = crate::cc_switch::read_claude_provider_env();
         if !cc_switch_env.is_empty() {
@@ -198,13 +201,16 @@ pub(super) async fn build(
 async fn resolve_agent_command_spec(
     meta: &aionui_api_types::AgentMetadata,
     workspace: &str,
+    conversation_id: &str,
+    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AppError> {
     let command = meta
         .command
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::BadRequest(format!("Agent '{}' has no spawn command configured", meta.name)))?;
-    let resolved = ensure_runtime_command(command)
+    let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
+    let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
         .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
 
@@ -468,6 +474,7 @@ fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilit
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_realtime::BroadcastEventBus;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
@@ -609,7 +616,12 @@ mod tests {
             handshake: aionui_api_types::AgentHandshake::default(),
         };
 
-        let spec = resolve_agent_command_spec(&meta, "/tmp/workspace")
+        let spec = resolve_agent_command_spec(
+            &meta,
+            "/tmp/workspace",
+            "conv-acp",
+            Arc::new(BroadcastEventBus::new(16)),
+        )
             .await
             .expect("resolved command spec");
 

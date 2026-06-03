@@ -9,8 +9,9 @@ use tracing::{debug, info, warn};
 pub use managed::{install_and_validate as install_managed_runtime, probe_support as probe_node_runtime_supported};
 pub use system::{derive_runtime_root, detect_system_runtime, probe_system_runtime, tool_command, validate_same_root};
 pub use types::{
-    DoctorRow, NodeRuntimeError, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,
-    ResolvedNodeSource, RuntimeCommandProbe,
+    DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,
+    NodeRuntimeProgressReporter, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,
+    ResolvedNodeSource, RuntimeCommandProbe, SharedNodeRuntimeProgressReporter,
 };
 
 static MANAGED_RUNTIME_CACHE: OnceLock<tokio::sync::Mutex<Option<ResolvedNodeRuntime>>> = OnceLock::new();
@@ -49,6 +50,12 @@ pub fn probe_runtime_command(command: &str) -> RuntimeCommandProbe {
 }
 
 pub async fn ensure_node_runtime() -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
+    ensure_node_runtime_with_reporter(None).await
+}
+
+pub async fn ensure_node_runtime_with_reporter(
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
     match detect_system_runtime().await {
         Ok(runtime) => {
             log_runtime_selected(&runtime);
@@ -57,7 +64,7 @@ pub async fn ensure_node_runtime() -> Result<ResolvedNodeRuntime, NodeRuntimeErr
         Err(error) => {
             log_system_runtime_rejected(&error);
 
-            if let Some(runtime) = cached_managed_runtime().await {
+            if let Some(runtime) = cached_managed_runtime_unreported().await {
                 log_runtime_selected(&runtime);
                 return Ok(runtime);
             }
@@ -65,12 +72,12 @@ pub async fn ensure_node_runtime() -> Result<ResolvedNodeRuntime, NodeRuntimeErr
             let lock = MANAGED_RUNTIME_INSTALL_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
             let _guard = lock.lock().await;
 
-            if let Some(runtime) = cached_managed_runtime().await {
+            if let Some(runtime) = cached_managed_runtime(reporter).await {
                 log_runtime_selected(&runtime);
                 return Ok(runtime);
             }
 
-            let runtime = install_managed_runtime().await?;
+            let runtime = install_managed_runtime_with_reporter(reporter).await?;
             *managed_runtime_cache().lock().await = Some(runtime.clone());
             log_runtime_selected(&runtime);
             Ok(runtime)
@@ -79,6 +86,13 @@ pub async fn ensure_node_runtime() -> Result<ResolvedNodeRuntime, NodeRuntimeErr
 }
 
 pub async fn ensure_runtime_command(command: &str) -> Result<ResolvedCommand, NodeRuntimeError> {
+    ensure_runtime_command_with_reporter(command, None).await
+}
+
+pub async fn ensure_runtime_command_with_reporter(
+    command: &str,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<ResolvedCommand, NodeRuntimeError> {
     match probe_runtime_command(command) {
         RuntimeCommandProbe::ExplicitPath { path } => {
             if !path.exists() {
@@ -93,7 +107,7 @@ pub async fn ensure_runtime_command(command: &str) -> Result<ResolvedCommand, No
             .map(ResolvedCommand::plain)
             .ok_or_else(|| NodeRuntimeError::system_invalid(format!("command '{command}' not found in PATH"))),
         RuntimeCommandProbe::NodeTool { tool, .. } => {
-            let runtime = ensure_node_runtime().await?;
+            let runtime = ensure_node_runtime_with_reporter(reporter).await?;
             Ok(tool_command(tool, &runtime))
         }
     }
@@ -140,10 +154,16 @@ fn managed_runtime_cache() -> &'static tokio::sync::Mutex<Option<ResolvedNodeRun
     MANAGED_RUNTIME_CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
-async fn cached_managed_runtime() -> Option<ResolvedNodeRuntime> {
+async fn cached_managed_runtime_unreported() -> Option<ResolvedNodeRuntime> {
+    cached_managed_runtime(None).await
+}
+
+async fn cached_managed_runtime(
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Option<ResolvedNodeRuntime> {
     let cached = managed_runtime_cache().lock().await.clone()?;
 
-    match managed::validate_managed_runtime(&cached.root).await {
+    match managed::validate_managed_runtime(&cached.root, reporter).await {
         Ok(runtime) => {
             *managed_runtime_cache().lock().await = Some(runtime.clone());
             Some(runtime)
@@ -221,6 +241,12 @@ async fn validate_runtime(
     let _ = command_version(runtime.npx_command(), "npx").await?;
     runtime.version = node_version;
     Ok(runtime)
+}
+
+async fn install_managed_runtime_with_reporter(
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
+    managed::install_and_validate_with_reporter(reporter).await
 }
 
 async fn command_version(command: ResolvedCommand, label: &str) -> Result<semver::Version, NodeRuntimeError> {
@@ -427,13 +453,15 @@ mod tests {
         let runtime = fake_managed_runtime(&root);
         *managed_runtime_cache().lock().await = Some(runtime.clone());
 
-        let cached = cached_managed_runtime().await.expect("cache should validate");
+        let cached = cached_managed_runtime_unreported()
+            .await
+            .expect("cache should validate");
         assert_eq!(cached.root, runtime.root);
 
         fs::remove_dir_all(&root).expect("remove runtime root");
 
         assert!(
-            cached_managed_runtime().await.is_none(),
+            cached_managed_runtime_unreported().await.is_none(),
             "deleted managed runtime should invalidate cache"
         );
         assert!(

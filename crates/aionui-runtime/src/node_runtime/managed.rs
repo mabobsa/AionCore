@@ -1,16 +1,24 @@
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use flate2::read::GzDecoder;
+use fs2::FileExt;
 use tracing::{info, warn};
 
 use crate::cache;
 
-use super::types::{NodeRuntimeError, NodeRuntimeSupport, ResolvedNodeRuntime, ResolvedNodeSource};
+use super::types::{
+    NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressReporter, NodeRuntimeSupport,
+    ResolvedNodeRuntime, ResolvedNodeSource,
+};
 
 const MANAGED_NODE_VERSION: &str = "24.11.0";
+const MANAGED_NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const MANAGED_NODE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const MANAGED_NODE_DOWNLOAD_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformSpec {
@@ -47,13 +55,29 @@ pub fn probe_support() -> NodeRuntimeSupport {
 }
 
 pub async fn install_and_validate() -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
-    let spec = platform_spec()?;
+    install_and_validate_with_reporter(None).await
+}
+
+pub async fn install_and_validate_with_reporter(
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
+    let spec = platform_spec().inspect_err(|error| {
+        emit_progress(
+            reporter,
+            NodeRuntimeProgress::failed(
+                NodeRuntimeFailureKind::UnsupportedPlatform,
+                error.to_string(),
+            ),
+        );
+    })?;
     let runtime_root = cache::node_runtime_root()
         .ok_or_else(|| NodeRuntimeError::managed_invalid("managed node runtime root unavailable"))?;
     fs::create_dir_all(&runtime_root).map_err(NodeRuntimeError::io_system)?;
+    let _lock =
+        InstallLockGuard::acquire(&install_lock_path(&runtime_root), reporter).map_err(NodeRuntimeError::io_system)?;
 
     let version_dir = runtime_root.join(spec.directory_name());
-    match validate_managed_runtime(&version_dir).await {
+    match validate_managed_runtime(&version_dir, None).await {
         Ok(runtime) => return Ok(runtime),
         Err(error) => {
             warn!(
@@ -70,9 +94,13 @@ pub async fn install_and_validate() -> Result<ResolvedNodeRuntime, NodeRuntimeEr
         url = %spec.download_url(),
         "managed node runtime install started"
     );
-    install_archive(&runtime_root, spec).await?;
-    match validate_managed_runtime(&version_dir).await {
+    install_archive_with_retry(&runtime_root, spec, reporter).await?;
+    match validate_managed_runtime(&version_dir, reporter).await {
         Ok(runtime) => {
+            emit_progress(
+                reporter,
+                NodeRuntimeProgress::ready(format!("managed Node runtime {} is ready", runtime.version)),
+            );
             info!(
                 version = %runtime.version,
                 root = %runtime.root.display(),
@@ -87,26 +115,37 @@ pub async fn install_and_validate() -> Result<ResolvedNodeRuntime, NodeRuntimeEr
                 "managed node runtime validation failed after install; retrying"
             );
             let _ = fs::remove_dir_all(&version_dir);
-            install_archive(&runtime_root, spec).await?;
-            validate_managed_runtime(&version_dir)
+            install_archive_with_retry(&runtime_root, spec, reporter).await?;
+            validate_managed_runtime(&version_dir, reporter)
                 .await
                 .inspect(|runtime| {
+                    emit_progress(
+                        reporter,
+                        NodeRuntimeProgress::ready(format!("managed Node runtime {} is ready", runtime.version)),
+                    );
                     info!(
                         version = %runtime.version,
                         root = %runtime.root.display(),
                         "managed node runtime install completed"
                     );
                 })
-                .map_err(|retry_error| {
-                    NodeRuntimeError::managed_invalid(format!("{first_error}; retry failed: {retry_error}"))
-                })
+                .map_err(|retry_error| combined_retry_error(first_error, retry_error, reporter))
         }
     }
 }
 
-pub(crate) async fn validate_managed_runtime(root: &Path) -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
+pub(crate) async fn validate_managed_runtime(
+    root: &Path,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<ResolvedNodeRuntime, NodeRuntimeError> {
+    emit_progress(
+        reporter,
+        NodeRuntimeProgress::validating(format!("validating managed Node runtime under {}", root.display())),
+    );
     let runtime = runtime_from_managed_root(root)?;
-    super::validate_runtime(runtime, None).await
+    super::validate_runtime(runtime, None)
+        .await
+        .map_err(|error| validation_error(error, reporter))
 }
 
 fn platform_spec() -> Result<PlatformSpec, NodeRuntimeError> {
@@ -211,29 +250,77 @@ fn runtime_from_managed_root(root: &Path) -> Result<ResolvedNodeRuntime, NodeRun
     })
 }
 
-async fn install_archive(runtime_root: &Path, spec: PlatformSpec) -> Result<(), NodeRuntimeError> {
+struct InstallLockGuard {
+    file: fs::File,
+}
+
+impl InstallLockGuard {
+    fn acquire(path: &Path, reporter: Option<&dyn NodeRuntimeProgressReporter>) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        if FileExt::try_lock_exclusive(&file).is_err() {
+            emit_progress(
+                reporter,
+                NodeRuntimeProgress::waiting_for_lock("waiting for another process to finish preparing managed Node"),
+            );
+            FileExt::lock_exclusive(&file)?;
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for InstallLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+async fn install_archive(
+    runtime_root: &Path,
+    spec: PlatformSpec,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<(), NodeRuntimeError> {
     let url = spec.download_url();
     let version_dir = runtime_root.join(spec.directory_name());
     if version_dir.exists() {
         let _ = fs::remove_dir_all(&version_dir);
     }
 
+    emit_progress(
+        reporter,
+        NodeRuntimeProgress::downloading(format!("downloading managed Node runtime from {url}")),
+    );
+
     let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(MANAGED_NODE_CONNECT_TIMEOUT)
+        .timeout(MANAGED_NODE_DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|error| NodeRuntimeError::managed_invalid(format!("build http client: {error}")))?
         .get(url.clone())
         .send()
         .await
-        .map_err(|error| NodeRuntimeError::managed_invalid(format!("download {url} failed: {error}")))?;
+        .map_err(|error| reqwest_error("download archive", &url, &error))?;
     let response = response
         .error_for_status()
-        .map_err(|error| NodeRuntimeError::managed_invalid(format!("download {url} failed: {error}")))?;
+        .map_err(|error| reqwest_error("download archive", &url, &error))?;
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| NodeRuntimeError::managed_invalid(format!("read archive body failed: {error}")))?;
+        .map_err(|error| reqwest_error("read archive body", &url, &error))?;
 
+    emit_progress(
+        reporter,
+        NodeRuntimeProgress::extracting(format!("extracting managed Node runtime into {}", runtime_root.display())),
+    );
     match spec.archive_ext {
         "tar.gz" => extract_tar_gz(bytes.as_ref(), runtime_root)?,
         "zip" => extract_zip(bytes.as_ref(), runtime_root)?,
@@ -245,6 +332,34 @@ async fn install_archive(runtime_root: &Path, spec: PlatformSpec) -> Result<(), 
     }
 
     Ok(())
+}
+
+async fn install_archive_with_retry(
+    runtime_root: &Path,
+    spec: PlatformSpec,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> Result<(), NodeRuntimeError> {
+    let mut last_error = None;
+    for attempt in 1..=MANAGED_NODE_DOWNLOAD_ATTEMPTS {
+        match install_archive(runtime_root, spec, reporter).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < MANAGED_NODE_DOWNLOAD_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    max_attempts = MANAGED_NODE_DOWNLOAD_ATTEMPTS,
+                    error = %error,
+                    root = %runtime_root.display(),
+                    "managed node runtime install attempt failed; retrying"
+                );
+                last_error = Some(error);
+            }
+            Err(error) => return Err(install_error(error, reporter)),
+        }
+    }
+
+    Err(last_error
+        .map(|error| install_error(error, reporter))
+        .unwrap_or_else(|| NodeRuntimeError::managed_invalid("managed node runtime install failed")))
 }
 
 fn extract_tar_gz(bytes: &[u8], runtime_root: &Path) -> Result<(), NodeRuntimeError> {
@@ -365,6 +480,113 @@ fn managed_prefix_bin_dir(root: &Path) -> PathBuf {
     }
 }
 
+fn install_lock_path(runtime_root: &Path) -> PathBuf {
+    runtime_root.join("node-runtime-install.lock")
+}
+
+fn emit_progress(reporter: Option<&dyn NodeRuntimeProgressReporter>, update: NodeRuntimeProgress) {
+    if let Some(reporter) = reporter {
+        reporter.report(update);
+    }
+}
+
+fn reqwest_error(stage: &str, url: &str, error: &reqwest::Error) -> NodeRuntimeError {
+    if error.is_timeout() {
+        return timeout_error(stage, url);
+    }
+    if let Some(status) = error.status() {
+        return http_status_error(stage, url, status);
+    }
+    if error.is_connect() {
+        return NodeRuntimeError::managed_invalid(format!("{stage} connect failed for {url}: {error}"));
+    }
+    NodeRuntimeError::managed_invalid(format!("{stage} failed for {url}: {error}"))
+}
+
+fn timeout_error(stage: &str, url: &str) -> NodeRuntimeError {
+    NodeRuntimeError::managed_invalid(format!(
+        "{stage} timed out after {}s for {url}",
+        MANAGED_NODE_DOWNLOAD_TIMEOUT.as_secs()
+    ))
+}
+
+fn http_status_error(stage: &str, url: &str, status: reqwest::StatusCode) -> NodeRuntimeError {
+    NodeRuntimeError::managed_invalid(format!("{stage} returned HTTP {} for {url}", status.as_u16()))
+}
+
+fn classify_error(error: &NodeRuntimeError) -> (NodeRuntimeFailureKind, Option<u16>) {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("timed out") {
+        return (NodeRuntimeFailureKind::Timeout, None);
+    }
+    if let Some(status) = parse_http_status(&message) {
+        return (NodeRuntimeFailureKind::HttpStatus, Some(status));
+    }
+    if message.contains("unsupported") {
+        return (NodeRuntimeFailureKind::UnsupportedPlatform, None);
+    }
+    if message.contains("validate") || message.contains("executable missing") || message.contains("entrypoint missing") {
+        return (NodeRuntimeFailureKind::ValidationFailed, None);
+    }
+    if message.contains("download") || message.contains("extract") || message.contains("connect failed") {
+        return (NodeRuntimeFailureKind::DownloadFailed, None);
+    }
+    (NodeRuntimeFailureKind::Unknown, None)
+}
+
+fn parse_http_status(message: &str) -> Option<u16> {
+    let marker = "http ";
+    let start = message.find(marker)? + marker.len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse::<u16>().ok()
+}
+
+fn install_error(
+    error: NodeRuntimeError,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> NodeRuntimeError {
+    let (kind, status_code) = classify_error(&error);
+    emit_progress(
+        reporter,
+        match status_code {
+            Some(status) => NodeRuntimeProgress::failed_with_status(kind, status, error.to_string()),
+            None => NodeRuntimeProgress::failed(kind, error.to_string()),
+        },
+    );
+    error
+}
+
+fn validation_error(
+    error: NodeRuntimeError,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> NodeRuntimeError {
+    emit_progress(
+        reporter,
+        NodeRuntimeProgress::failed(NodeRuntimeFailureKind::ValidationFailed, error.to_string()),
+    );
+    error
+}
+
+fn combined_retry_error(
+    first_error: NodeRuntimeError,
+    retry_error: NodeRuntimeError,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> NodeRuntimeError {
+    let combined = NodeRuntimeError::managed_invalid(format!("{first_error}; retry failed: {retry_error}"));
+    let (kind, status_code) = classify_error(&retry_error);
+    emit_progress(
+        reporter,
+        match status_code {
+            Some(status) => NodeRuntimeProgress::failed_with_status(kind, status, combined.to_string()),
+            None => NodeRuntimeProgress::failed(kind, combined.to_string()),
+        },
+    );
+    combined
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,7 +608,7 @@ mod tests {
             std::fs::set_permissions(&node, perms).unwrap();
         }
 
-        let err = validate_managed_runtime(&root).await.unwrap_err();
+        let err = validate_managed_runtime(&root, None).await.unwrap_err();
         assert!(err.to_string().to_ascii_lowercase().contains("npm"));
     }
 
@@ -395,6 +617,32 @@ mod tests {
         let support = probe_support();
         let expected = cfg!(target_os = "macos") || cfg!(target_os = "linux") || cfg!(windows);
         assert_eq!(support.supported, expected);
+    }
+
+    #[test]
+    fn managed_runtime_install_lock_path_uses_runtime_root() {
+        let root = PathBuf::from("/tmp/aionui/runtime/node");
+        assert_eq!(install_lock_path(&root), root.join("node-runtime-install.lock"));
+    }
+
+    #[test]
+    fn managed_runtime_timeout_error_is_explicit() {
+        let error = timeout_error("download archive", "https://example.com/node.tar.gz");
+        let message = error.to_string();
+        assert!(message.contains("download archive timed out"));
+        assert!(message.contains("600s"));
+    }
+
+    #[test]
+    fn managed_runtime_http_status_error_is_explicit() {
+        let error = http_status_error(
+            "download archive",
+            "https://example.com/node.tar.gz",
+            reqwest::StatusCode::BAD_GATEWAY,
+        );
+        let message = error.to_string();
+        assert!(message.contains("HTTP 502"));
+        assert!(message.contains("download archive"));
     }
 
     #[test]

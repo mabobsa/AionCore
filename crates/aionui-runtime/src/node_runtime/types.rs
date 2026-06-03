@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use semver::Version;
 
@@ -70,6 +71,114 @@ impl ResolvedNodeRuntime {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRuntimeProgressPhase {
+    WaitingForLock,
+    Downloading,
+    Extracting,
+    Validating,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRuntimeFailureKind {
+    Timeout,
+    DownloadFailed,
+    HttpStatus,
+    ValidationFailed,
+    UnsupportedPlatform,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRuntimeProgress {
+    pub phase: NodeRuntimeProgressPhase,
+    pub failure_kind: Option<NodeRuntimeFailureKind>,
+    pub message: Option<String>,
+    pub status_code: Option<u16>,
+}
+
+impl NodeRuntimeProgress {
+    pub fn waiting_for_lock(message: impl Into<String>) -> Self {
+        Self {
+            phase: NodeRuntimeProgressPhase::WaitingForLock,
+            failure_kind: None,
+            message: Some(message.into()),
+            status_code: None,
+        }
+    }
+
+    pub fn downloading(message: impl Into<String>) -> Self {
+        Self {
+            phase: NodeRuntimeProgressPhase::Downloading,
+            failure_kind: None,
+            message: Some(message.into()),
+            status_code: None,
+        }
+    }
+
+    pub fn extracting(message: impl Into<String>) -> Self {
+        Self {
+            phase: NodeRuntimeProgressPhase::Extracting,
+            failure_kind: None,
+            message: Some(message.into()),
+            status_code: None,
+        }
+    }
+
+    pub fn validating(message: impl Into<String>) -> Self {
+        Self {
+            phase: NodeRuntimeProgressPhase::Validating,
+            failure_kind: None,
+            message: Some(message.into()),
+            status_code: None,
+        }
+    }
+
+    pub fn ready(message: impl Into<String>) -> Self {
+        Self {
+            phase: NodeRuntimeProgressPhase::Ready,
+            failure_kind: None,
+            message: Some(message.into()),
+            status_code: None,
+        }
+    }
+
+    pub fn failed(kind: NodeRuntimeFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            phase: NodeRuntimeProgressPhase::Failed,
+            failure_kind: Some(kind),
+            message: Some(message.into()),
+            status_code: None,
+        }
+    }
+
+    pub fn failed_with_status(kind: NodeRuntimeFailureKind, status_code: u16, message: impl Into<String>) -> Self {
+        Self {
+            phase: NodeRuntimeProgressPhase::Failed,
+            failure_kind: Some(kind),
+            message: Some(message.into()),
+            status_code: Some(status_code),
+        }
+    }
+}
+
+pub trait NodeRuntimeProgressReporter: Send + Sync {
+    fn report(&self, update: NodeRuntimeProgress);
+}
+
+impl<F> NodeRuntimeProgressReporter for F
+where
+    F: Fn(NodeRuntimeProgress) + Send + Sync,
+{
+    fn report(&self, update: NodeRuntimeProgress) {
+        self(update);
+    }
+}
+
+pub type SharedNodeRuntimeProgressReporter = Arc<dyn NodeRuntimeProgressReporter>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRuntimeSupport {

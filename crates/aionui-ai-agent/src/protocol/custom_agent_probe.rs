@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use aionui_api_types::TryConnectCustomAgentResponse;
 use aionui_common::{CommandSpec, EnvVar};
-use aionui_runtime::ensure_runtime_command;
+use aionui_runtime::{NodeRuntimeProgressReporter, ensure_runtime_command_with_reporter};
 use tokio::sync::{broadcast, mpsc};
 use tracing::debug;
 
@@ -40,10 +40,11 @@ pub async fn try_connect_custom_agent(
     args: &[String],
     env: &HashMap<String, String>,
     data_dir: &Path,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
 ) -> TryConnectCustomAgentResponse {
     // ── Step 1 — which check ────────────────────────────────────────
     let head = first_token(command);
-    let resolved = match ensure_runtime_command(head).await {
+    let resolved = match ensure_runtime_command_with_reporter(head, reporter).await {
         Ok(resolved) => resolved,
         Err(error) => {
             return TryConnectCustomAgentResponse::FailCli {
@@ -153,7 +154,8 @@ mod tests {
     #[tokio::test]
     async fn probe_returns_fail_cli_when_command_missing() {
         let tmp = std::env::temp_dir();
-        let resp = try_connect_custom_agent("aionui-definitely-does-not-exist-xyz", &[], &HashMap::new(), &tmp).await;
+        let resp =
+            try_connect_custom_agent("aionui-definitely-does-not-exist-xyz", &[], &HashMap::new(), &tmp, None).await;
         match resp {
             TryConnectCustomAgentResponse::FailCli { error } => {
                 let lower = error.to_lowercase();
@@ -176,7 +178,7 @@ mod tests {
             return;
         }
         let tmp = std::env::temp_dir();
-        let resp = try_connect_custom_agent("true", &[], &HashMap::new(), &tmp).await;
+        let resp = try_connect_custom_agent("true", &[], &HashMap::new(), &tmp, None).await;
         assert!(
             matches!(resp, TryConnectCustomAgentResponse::FailAcp { .. }),
             "expected FailAcp, got {resp:?}"

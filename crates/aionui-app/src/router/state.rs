@@ -154,6 +154,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
+        services.event_bus.clone(),
         provider_repo,
         encryption_key,
         services.data_dir.clone(),
@@ -339,7 +340,7 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     McpRouterState {
         config_service: McpConfigService::new(repo.clone()),
         sync_service: McpSyncService::new(repo, adapters),
-        connection_test_service: McpConnectionTestService::new(http_client.clone()),
+        connection_test_service: McpConnectionTestService::new(http_client.clone(), services.event_bus.clone()),
         oauth_service: aionui_mcp::McpOAuthService::new(oauth_token_repo, http_client),
     }
 }

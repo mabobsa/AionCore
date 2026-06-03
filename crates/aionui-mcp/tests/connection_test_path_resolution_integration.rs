@@ -6,8 +6,10 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aionui_mcp::{McpConnectionTestService, McpServerTransport};
+use aionui_realtime::BroadcastEventBus;
 
 #[tokio::test]
 async fn stdio_npx_resolves_from_enhanced_process_path() {
@@ -60,7 +62,7 @@ done
         std::env::set_var("PATH", &bin_dir);
     }
 
-    let svc = McpConnectionTestService::new(reqwest::Client::new());
+    let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
     let transport = McpServerTransport::Stdio {
         command: "npx".into(),
         args: vec![],
