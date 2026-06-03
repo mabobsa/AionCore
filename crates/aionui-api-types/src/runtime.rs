@@ -18,6 +18,7 @@ pub struct RuntimeStatusScope {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeResourceKind {
     Node,
+    AcpTool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +46,8 @@ pub enum RuntimeFailureKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeStatusPayload {
     pub resource: RuntimeResourceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
     pub scope: RuntimeStatusScope,
     pub phase: RuntimeStatusPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +68,17 @@ pub struct EnsureNodeRuntimeResponse {
     pub ready: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureManagedAcpToolRequest {
+    pub scope: RuntimeStatusScope,
+    pub tool_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureManagedAcpToolResponse {
+    pub ready: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +87,7 @@ mod tests {
     fn runtime_status_payload_serializes() {
         let payload = RuntimeStatusPayload {
             resource: RuntimeResourceKind::Node,
+            resource_id: None,
             scope: RuntimeStatusScope {
                 kind: RuntimeStatusScopeKind::Conversation,
                 id: "conv-1".into(),
@@ -102,6 +117,22 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["scope"]["kind"], "mcp");
         let parsed: EnsureNodeRuntimeRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn ensure_managed_acp_tool_request_roundtrips() {
+        let request = EnsureManagedAcpToolRequest {
+            scope: RuntimeStatusScope {
+                kind: RuntimeStatusScopeKind::Conversation,
+                id: "conv-2".into(),
+            },
+            tool_id: "codex-acp".into(),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["tool_id"], "codex-acp");
+        let parsed: EnsureManagedAcpToolRequest = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, request);
     }
 }

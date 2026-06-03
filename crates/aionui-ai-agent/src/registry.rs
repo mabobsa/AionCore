@@ -20,7 +20,10 @@ use std::sync::Arc;
 use aionui_api_types::{AgentEnvEntry, AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};
 use aionui_common::{AgentType, AppError};
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
-use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
+use aionui_runtime::{
+    ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
+    probe_runtime_command, resolve_command_path,
+};
 use serde_json::Value;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
@@ -530,6 +533,9 @@ pub enum UnavailableReason {
     /// direct-CLI rows this is the same binary as `binary_name`; for
     /// bridge rows it's the bridge.
     CommandMissing { command: String },
+    /// Managed runtime/tool support is unavailable even though the row
+    /// itself is builtin and no ambient PATH lookup should be required.
+    ManagedRuntimeUnavailable { resource: String, detail: String },
 }
 
 impl std::fmt::Display for UnavailableReason {
@@ -540,6 +546,9 @@ impl std::fmt::Display for UnavailableReason {
             Self::BridgeMissing { bridge } => write!(f, "bridge binary `{bridge}` not on $PATH"),
             Self::PrimaryMissing { binary } => write!(f, "primary binary `{binary}` not on $PATH"),
             Self::CommandMissing { command } => write!(f, "spawn command `{command}` not on $PATH"),
+            Self::ManagedRuntimeUnavailable { resource, detail } => {
+                write!(f, "managed `{resource}` unavailable: {detail}")
+            }
         }
     }
 }
@@ -559,6 +568,28 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
     if !meta.enabled {
         return Err(UnavailableReason::Disabled);
     }
+
+    if meta.agent_source == AgentSource::Builtin
+        && let Some(backend) = meta.backend.as_deref()
+        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
+    {
+        let node_support = probe_node_runtime_supported();
+        if !node_support.is_supported() {
+            return Err(UnavailableReason::ManagedRuntimeUnavailable {
+                resource: "node".to_owned(),
+                detail: node_support.detail,
+            });
+        }
+        let tool_support = probe_managed_acp_tool_supported(tool);
+        if !tool_support.is_supported() {
+            return Err(UnavailableReason::ManagedRuntimeUnavailable {
+                resource: tool.slug().to_owned(),
+                detail: tool_support.detail,
+            });
+        }
+        return Ok(PathBuf::from(tool.slug()));
+    }
+
     let Some(cmd) = meta.command.as_deref().filter(|s| !s.is_empty()) else {
         return Err(UnavailableReason::NoCommand);
     };

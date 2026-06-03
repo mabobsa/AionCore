@@ -6,6 +6,7 @@
 //! to prepend the runtime directory to child-process `PATH`.
 
 mod cache;
+pub mod acp_tool_runtime;
 mod embed;
 mod extract;
 pub mod node_runtime;
@@ -13,6 +14,13 @@ mod resolver;
 mod shell_env;
 
 pub use cache::init;
+pub use acp_tool_runtime::{
+    ManagedAcpToolError, ManagedAcpToolFailureKind, ManagedAcpToolId, ManagedAcpToolProgress,
+    ManagedAcpToolProgressPhase, ManagedAcpToolProgressReporter, ManagedAcpToolSupport,
+    ResolvedManagedAcpTool, SharedManagedAcpToolProgressReporter, doctor_snapshot as acp_tool_doctor_snapshot,
+    ensure_managed_acp_tool,
+    ensure_managed_acp_tool_with_reporter, probe_managed_acp_tool_supported,
+};
 pub use node_runtime::{
     DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,
     NodeRuntimeProgressReporter, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,

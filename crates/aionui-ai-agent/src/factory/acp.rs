@@ -12,10 +12,13 @@ use aionui_common::{AppError, CommandSpec};
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
-use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
+use aionui_runtime::{
+    ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter,
+    ensure_runtime_command, ensure_runtime_command_with_reporter,
+};
 use tracing::{debug, info, warn};
 
-use crate::runtime_status::conversation_runtime_reporter;
+use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -204,6 +207,13 @@ async fn resolve_agent_command_spec(
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AppError> {
+    if meta.agent_source == aionui_api_types::AgentSource::Builtin
+        && let Some(backend) = meta.backend.as_deref()
+        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
+    {
+        return resolve_builtin_managed_acp_command_spec(meta, workspace, conversation_id, broadcaster, tool).await;
+    }
+
     let command = meta
         .command
         .as_deref()
@@ -220,6 +230,53 @@ async fn resolve_agent_command_spec(
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     args.extend(meta.args.iter().cloned());
+
+    let mut env: Vec<aionui_common::EnvVar> = meta
+        .env
+        .iter()
+        .map(|entry| aionui_common::EnvVar {
+            name: entry.name.clone(),
+            value: entry.value.clone(),
+        })
+        .collect();
+    env.extend(resolved.env.iter().map(|(name, value)| aionui_common::EnvVar {
+        name: name.to_string_lossy().into_owned(),
+        value: value.to_string_lossy().into_owned(),
+    }));
+
+    Ok(CommandSpec {
+        command: resolved.program,
+        args,
+        env,
+        cwd: Some(workspace.to_owned()),
+    })
+}
+
+async fn resolve_builtin_managed_acp_command_spec(
+    meta: &aionui_api_types::AgentMetadata,
+    workspace: &str,
+    conversation_id: &str,
+    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
+    tool: ManagedAcpToolId,
+) -> Result<CommandSpec, AppError> {
+    let node_reporter = conversation_runtime_reporter(broadcaster.clone(), conversation_id.to_owned());
+    let node_runtime = ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
+
+    let tool_reporter =
+        conversation_acp_tool_runtime_reporter(broadcaster, conversation_id.to_owned(), tool);
+    let managed_tool = ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
+
+    let resolved = managed_tool.command(&node_runtime);
+
+    let args: Vec<String> = resolved
+        .args_prefix
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
 
     let mut env: Vec<aionui_common::EnvVar> = meta
         .env

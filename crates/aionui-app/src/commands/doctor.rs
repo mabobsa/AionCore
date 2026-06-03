@@ -24,7 +24,7 @@ use anyhow::Result;
 
 use aionui_ai_agent::{AgentRegistry, UnavailableReason};
 use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database, maybe_copy_legacy_database};
-use aionui_runtime::doctor_snapshot;
+use aionui_runtime::{acp_tool_doctor_snapshot, doctor_snapshot};
 
 use crate::cli::Cli;
 
@@ -65,16 +65,29 @@ fn print_environment(merged_path: &str, data_dir: &Path) {
 }
 
 fn runtime_snapshot_lines() -> Vec<String> {
-    let rows = doctor_snapshot();
-    if rows.is_empty() {
+    let node_rows = doctor_snapshot();
+    let acp_rows = acp_tool_doctor_snapshot();
+    if node_rows.is_empty() && acp_rows.is_empty() {
         return Vec::new();
     }
 
-    let mut lines = vec!["  node runtime   :".to_owned()];
-    lines.extend(
-        rows.into_iter()
-            .map(|row| format!("    {:<4} {:<10} {}", row.tool, row.source, row.detail)),
-    );
+    let mut lines = Vec::new();
+    if !node_rows.is_empty() {
+        lines.push("  node runtime   :".to_owned());
+        lines.extend(
+            node_rows
+                .into_iter()
+                .map(|row| format!("    {:<16} {:<10} {}", row.tool, row.source, row.detail)),
+        );
+    }
+    if !acp_rows.is_empty() {
+        lines.push("  managed acp    :".to_owned());
+        lines.extend(
+            acp_rows
+                .into_iter()
+                .map(|row| format!("    {:<16} {:<10} {}", row.tool, row.source, row.detail)),
+        );
+    }
     lines
 }
 
@@ -125,6 +138,9 @@ fn describe_reason(reason: &UnavailableReason) -> String {
         UnavailableReason::BridgeMissing { bridge } => format!("bridge `{bridge}` not on $PATH"),
         UnavailableReason::PrimaryMissing { binary } => format!("CLI `{binary}` not on $PATH"),
         UnavailableReason::CommandMissing { command } => format!("`{command}` not on $PATH"),
+        UnavailableReason::ManagedRuntimeUnavailable { resource, detail } => {
+            format!("managed `{resource}` unavailable: {detail}")
+        }
     }
 }
 
@@ -141,5 +157,6 @@ mod tests {
 
         assert_eq!(lines[0], "  node runtime   :");
         assert!(lines.iter().skip(1).any(|line| line.contains("node")));
+        assert!(lines.iter().any(|line| line == "  managed acp    :"));
     }
 }

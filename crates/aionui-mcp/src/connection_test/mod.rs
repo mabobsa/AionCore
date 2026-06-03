@@ -407,6 +407,7 @@ impl McpConnectionTestService {
         Arc::new(move |update: NodeRuntimeProgress| {
             let payload = RuntimeStatusPayload {
                 resource: RuntimeResourceKind::Node,
+                resource_id: None,
                 scope: RuntimeStatusScope {
                     kind: RuntimeStatusScopeKind::Mcp,
                     id: scope_id.clone(),
