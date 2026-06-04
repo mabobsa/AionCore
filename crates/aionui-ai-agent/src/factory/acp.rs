@@ -13,8 +13,8 @@ use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_runtime::{
-    ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter,
-    ensure_runtime_command, ensure_runtime_command_with_reporter,
+    ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, ensure_runtime_command,
+    ensure_runtime_command_with_reporter,
 };
 use tracing::{debug, info, warn};
 
@@ -264,8 +264,7 @@ async fn resolve_builtin_managed_acp_command_spec(
         .await
         .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
 
-    let tool_reporter =
-        conversation_acp_tool_runtime_reporter(broadcaster, conversation_id.to_owned(), tool);
+    let tool_reporter = conversation_acp_tool_runtime_reporter(broadcaster, conversation_id.to_owned(), tool);
     let managed_tool = ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
         .await
         .map_err(|error| AppError::BadRequest(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;

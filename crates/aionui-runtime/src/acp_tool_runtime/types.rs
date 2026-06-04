@@ -172,11 +172,7 @@ impl ManagedAcpToolProgress {
         }
     }
 
-    pub fn failed_with_status(
-        kind: ManagedAcpToolFailureKind,
-        status_code: u16,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn failed_with_status(kind: ManagedAcpToolFailureKind, status_code: u16, message: impl Into<String>) -> Self {
         Self {
             phase: ManagedAcpToolProgressPhase::Failed,
             failure_kind: Some(kind),

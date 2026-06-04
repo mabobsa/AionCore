@@ -1,5 +1,6 @@
 mod types;
 
+use std::error::Error as StdError;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::cache;
+use crate::http_client;
 use crate::node_runtime::DoctorRow;
 
 pub use types::{
@@ -47,9 +49,13 @@ struct ManagedAcpArtifact {
     sha256: String,
 }
 
-pub async fn ensure_managed_acp_tool(
-    tool: ManagedAcpToolId,
-) -> Result<ResolvedManagedAcpTool, ManagedAcpToolError> {
+#[derive(Debug, Clone)]
+struct RemoteSource {
+    label: &'static str,
+    url: String,
+}
+
+pub async fn ensure_managed_acp_tool(tool: ManagedAcpToolId) -> Result<ResolvedManagedAcpTool, ManagedAcpToolError> {
     ensure_managed_acp_tool_with_reporter(tool, None).await
 }
 
@@ -80,7 +86,11 @@ pub fn probe_managed_acp_tool_supported(tool: ManagedAcpToolId) -> ManagedAcpToo
         Ok(spec) => match tool_root(tool, spec) {
             Ok(root) => ManagedAcpToolSupport {
                 supported: true,
-                detail: format!("managed {} artifact supported under {}", tool.display_name(), root.display()),
+                detail: format!(
+                    "managed {} artifact supported under {}",
+                    tool.display_name(),
+                    root.display()
+                ),
             },
             Err(error) => ManagedAcpToolSupport {
                 supported: false,
@@ -224,37 +234,7 @@ async fn install_tool(
     let archive_path = archive_download_path(root, spec);
     let _ = fs::remove_file(&archive_path);
 
-    emit_progress(
-        reporter,
-        ManagedAcpToolProgress::downloading(format!(
-            "downloading managed {} artifact from {}",
-            tool.display_name(),
-            artifact.url
-        )),
-    );
-    info!(
-        tool = tool.slug(),
-        version = tool.version(),
-        platform = spec.manifest_key,
-        url = %artifact.url,
-        "managed ACP tool download source selected"
-    );
-
-    let response = client
-        .get(artifact.url.clone())
-        .send()
-        .await
-        .map_err(|error| reqwest_error("download ACP tool archive", &artifact.url, &error))?;
-    let response = response
-        .error_for_status()
-        .map_err(|error| reqwest_error("download ACP tool archive", &artifact.url, &error))?;
-    stream_archive_to_file(response, &archive_path, &artifact.url, reporter).await?;
-
-    emit_progress(
-        reporter,
-        ManagedAcpToolProgress::validating(format!("verifying managed {} artifact checksum", tool.display_name())),
-    );
-    verify_archive_checksum(&archive_path, &artifact.sha256)?;
+    download_artifact_with_fallback(tool, spec, artifact, &client, &archive_path, reporter).await?;
 
     emit_progress(
         reporter,
@@ -263,7 +243,11 @@ async fn install_tool(
     match spec.archive_ext {
         "tar.zst" => extract_tar_zst(&archive_path, root)?,
         "zip" => extract_zip(&archive_path, root)?,
-        ext => return Err(ManagedAcpToolError::invalid(format!("unsupported ACP archive extension: {ext}"))),
+        ext => {
+            return Err(ManagedAcpToolError::invalid(format!(
+                "unsupported ACP archive extension: {ext}"
+            )));
+        }
     }
     let _ = fs::remove_file(&archive_path);
 
@@ -362,22 +346,91 @@ struct LocalArtifactManifest {
 fn read_local_manifest(root: &Path) -> Result<LocalArtifactManifest, ManagedAcpToolError> {
     let path = root.join("manifest.json");
     let contents = fs::read_to_string(&path).map_err(ManagedAcpToolError::io)?;
-    serde_json::from_str(&contents)
-        .map_err(|error| ManagedAcpToolError::invalid(format!("parse local ACP manifest failed for {}: {error}", path.display())))
+    serde_json::from_str(&contents).map_err(|error| {
+        ManagedAcpToolError::invalid(format!(
+            "parse local ACP manifest failed for {}: {error}",
+            path.display()
+        ))
+    })
 }
 
-async fn fetch_manifest(client: &reqwest::Client, tool: ManagedAcpToolId) -> Result<ManagedAcpManifest, ManagedAcpToolError> {
-    let url = manifest_url(tool);
-    let manifest = client
-        .get(url.clone())
+async fn fetch_manifest(
+    client: &reqwest::Client,
+    tool: ManagedAcpToolId,
+) -> Result<ManagedAcpManifest, ManagedAcpToolError> {
+    let sources = manifest_sources(tool);
+    let mut last_error = None;
+
+    for (index, source) in sources.iter().enumerate() {
+        match fetch_manifest_from_source(client, tool, source).await {
+            Ok(manifest) => {
+                if index > 0 {
+                    info!(
+                        tool = tool.slug(),
+                        version = tool.version(),
+                        source = source.label,
+                        url = %source.url,
+                        "managed ACP manifest fallback source selected"
+                    );
+                }
+                return Ok(manifest);
+            }
+            Err(error) if index + 1 < sources.len() => {
+                warn!(
+                    tool = tool.slug(),
+                    version = tool.version(),
+                    source = source.label,
+                    url = %source.url,
+                    error = %error,
+                    "managed ACP manifest source failed; trying fallback"
+                );
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| ManagedAcpToolError::invalid("managed ACP manifest fetch failed")))
+}
+
+fn manifest_url(tool: ManagedAcpToolId) -> String {
+    format!(
+        "{}/{}/{}/manifest.json",
+        MANAGED_ACP_TOOL_CDN_BASE,
+        tool.slug(),
+        tool.version()
+    )
+}
+
+fn manifest_sources(tool: ManagedAcpToolId) -> Vec<RemoteSource> {
+    vec![RemoteSource {
+        label: "cdn",
+        url: manifest_url(tool),
+    }]
+}
+
+async fn fetch_manifest_from_source(
+    client: &reqwest::Client,
+    tool: ManagedAcpToolId,
+    source: &RemoteSource,
+) -> Result<ManagedAcpManifest, ManagedAcpToolError> {
+    let response = client
+        .get(source.url.clone())
         .send()
         .await
-        .map_err(|error| reqwest_error("fetch managed ACP manifest", &url, &error))?
-        .error_for_status()
-        .map_err(|error| reqwest_error("fetch managed ACP manifest", &url, &error))?
+        .map_err(|error| reqwest_error("fetch managed ACP manifest", &source.url, &error))?;
+    let manifest = error_for_status_with_context(response, "fetch managed ACP manifest", &source.url)
+        .await?
         .json::<ManagedAcpManifest>()
         .await
-        .map_err(|error| ManagedAcpToolError::invalid(format!("parse managed ACP manifest failed for {url}: {error}")))?;
+        .map_err(|error| {
+            ManagedAcpToolError::invalid(format!("parse managed ACP manifest failed for {}: {error}", source.url))
+        })?;
+    validate_remote_manifest(tool, &manifest)?;
+    Ok(manifest)
+}
+
+fn validate_remote_manifest(tool: ManagedAcpToolId, manifest: &ManagedAcpManifest) -> Result<(), ManagedAcpToolError> {
     if manifest.tool != tool.slug() {
         return Err(ManagedAcpToolError::invalid(format!(
             "managed ACP manifest tool mismatch: expected {}, got {}",
@@ -392,11 +445,7 @@ async fn fetch_manifest(client: &reqwest::Client, tool: ManagedAcpToolId) -> Res
             manifest.version
         )));
     }
-    Ok(manifest)
-}
-
-fn manifest_url(tool: ManagedAcpToolId) -> String {
-    format!("{}/{}/{}/manifest.json", MANAGED_ACP_TOOL_CDN_BASE, tool.slug(), tool.version())
+    Ok(())
 }
 
 fn archive_download_path(root: &Path, spec: PlatformSpec) -> PathBuf {
@@ -408,11 +457,8 @@ fn install_lock_path(root: &Path) -> PathBuf {
 }
 
 fn build_http_client() -> Result<reqwest::Client, ManagedAcpToolError> {
-    reqwest::Client::builder()
-        .connect_timeout(MANAGED_ACP_CONNECT_TIMEOUT)
-        .timeout(MANAGED_ACP_DOWNLOAD_TIMEOUT)
-        .build()
-        .map_err(|error| ManagedAcpToolError::invalid(format!("build http client: {error}")))
+    http_client::build_http_client(MANAGED_ACP_CONNECT_TIMEOUT, MANAGED_ACP_DOWNLOAD_TIMEOUT)
+        .map_err(ManagedAcpToolError::invalid)
 }
 
 async fn stream_archive_to_file(
@@ -429,7 +475,7 @@ async fn stream_archive_to_file(
     loop {
         let chunk = tokio::time::timeout(MANAGED_ACP_DOWNLOAD_IDLE_TIMEOUT, response.chunk())
             .await
-            .map_err(|_| timeout_error("read ACP archive body", url, MANAGED_ACP_DOWNLOAD_IDLE_TIMEOUT))?
+            .map_err(|_| timeout_error("read ACP archive body", url, MANAGED_ACP_DOWNLOAD_IDLE_TIMEOUT, None))?
             .map_err(|error| reqwest_error("read ACP archive body", url, &error))?;
         let Some(chunk) = chunk else {
             break;
@@ -451,6 +497,104 @@ async fn stream_archive_to_file(
 
     writer.flush().map_err(ManagedAcpToolError::io)?;
     Ok(())
+}
+
+async fn download_artifact_with_fallback(
+    tool: ManagedAcpToolId,
+    spec: PlatformSpec,
+    artifact: &ManagedAcpArtifact,
+    client: &reqwest::Client,
+    archive_path: &Path,
+    reporter: Option<&dyn ManagedAcpToolProgressReporter>,
+) -> Result<(), ManagedAcpToolError> {
+    let sources = artifact_sources(tool, spec, artifact);
+    let mut last_error = None;
+
+    for (index, source) in sources.iter().enumerate() {
+        emit_progress(
+            reporter,
+            ManagedAcpToolProgress::downloading(format!(
+                "downloading managed {} artifact from {}",
+                tool.display_name(),
+                source.url
+            )),
+        );
+        info!(
+            tool = tool.slug(),
+            version = tool.version(),
+            platform = spec.manifest_key,
+            source = source.label,
+            url = %source.url,
+            "managed ACP tool download source selected"
+        );
+
+        let _ = fs::remove_file(archive_path);
+        match download_artifact_from_source(client, &source.url, archive_path, reporter).await {
+            Ok(()) => {
+                emit_progress(
+                    reporter,
+                    ManagedAcpToolProgress::validating(format!(
+                        "verifying managed {} artifact checksum",
+                        tool.display_name()
+                    )),
+                );
+                match verify_archive_checksum(archive_path, &artifact.sha256) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if index + 1 < sources.len() => {
+                        warn!(
+                            tool = tool.slug(),
+                            version = tool.version(),
+                            platform = spec.manifest_key,
+                            source = source.label,
+                            url = %source.url,
+                            error = %error,
+                            "managed ACP artifact source failed checksum validation; trying fallback"
+                        );
+                        last_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if index + 1 < sources.len() => {
+                warn!(
+                    tool = tool.slug(),
+                    version = tool.version(),
+                    platform = spec.manifest_key,
+                    source = source.label,
+                    url = %source.url,
+                    error = %error,
+                    "managed ACP artifact source failed; trying fallback"
+                );
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| ManagedAcpToolError::invalid("managed ACP artifact download failed")))
+}
+
+async fn download_artifact_from_source(
+    client: &reqwest::Client,
+    url: &str,
+    archive_path: &Path,
+    reporter: Option<&dyn ManagedAcpToolProgressReporter>,
+) -> Result<(), ManagedAcpToolError> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| reqwest_error("download ACP tool archive", url, &error))?;
+    let response = error_for_status_with_context(response, "download ACP tool archive", url).await?;
+    stream_archive_to_file(response, archive_path, url, reporter).await
+}
+
+fn artifact_sources(tool: ManagedAcpToolId, spec: PlatformSpec, artifact: &ManagedAcpArtifact) -> Vec<RemoteSource> {
+    let _ = (tool, spec);
+    vec![RemoteSource {
+        label: "manifest",
+        url: artifact.url.clone(),
+    }]
 }
 
 fn verify_archive_checksum(path: &Path, expected_sha256: &str) -> Result<(), ManagedAcpToolError> {
@@ -516,24 +660,101 @@ fn emit_progress(reporter: Option<&dyn ManagedAcpToolProgressReporter>, update: 
 }
 
 fn reqwest_error(stage: &str, url: &str, error: &reqwest::Error) -> ManagedAcpToolError {
+    let detail = format_error_with_causes(error);
     if error.is_timeout() {
-        return timeout_error(stage, url, MANAGED_ACP_DOWNLOAD_TIMEOUT);
+        return timeout_error(stage, url, MANAGED_ACP_DOWNLOAD_TIMEOUT, Some(&detail));
     }
     if let Some(status) = error.status() {
-        return http_status_error(stage, url, status);
+        return http_status_error(stage, url, status, None, None);
     }
     if error.is_connect() {
-        return ManagedAcpToolError::invalid(format!("{stage} connect failed for {url}: {error}"));
+        return ManagedAcpToolError::invalid(format!("{stage} connect failed for {url}: {detail}"));
     }
-    ManagedAcpToolError::invalid(format!("{stage} failed for {url}: {error}"))
+    ManagedAcpToolError::invalid(format!("{stage} failed for {url}: {detail}"))
 }
 
-fn timeout_error(stage: &str, url: &str, timeout: Duration) -> ManagedAcpToolError {
-    ManagedAcpToolError::invalid(format!("{stage} timed out after {}s for {url}", timeout.as_secs()))
+async fn error_for_status_with_context(
+    response: reqwest::Response,
+    stage: &str,
+    url: &str,
+) -> Result<reqwest::Response, ManagedAcpToolError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let headers = summarize_response_headers(response.headers());
+    let body_excerpt = extract_response_body_excerpt(response).await;
+    Err(http_status_error(
+        stage,
+        url,
+        status,
+        headers.as_deref(),
+        body_excerpt.as_deref(),
+    ))
 }
 
-fn http_status_error(stage: &str, url: &str, status: reqwest::StatusCode) -> ManagedAcpToolError {
-    ManagedAcpToolError::invalid(format!("{stage} returned HTTP {} for {url}", status.as_u16()))
+fn timeout_error(stage: &str, url: &str, timeout: Duration, detail: Option<&str>) -> ManagedAcpToolError {
+    let message = format!("{stage} timed out after {}s for {url}", timeout.as_secs());
+    match detail {
+        Some(detail) if !detail.is_empty() => ManagedAcpToolError::invalid(format!("{message}: {detail}")),
+        _ => ManagedAcpToolError::invalid(message),
+    }
+}
+
+fn http_status_error(
+    stage: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    headers: Option<&str>,
+    body_excerpt: Option<&str>,
+) -> ManagedAcpToolError {
+    let mut message = format!("{stage} returned HTTP {} for {url}", status.as_u16());
+    if let Some(headers) = headers
+        && !headers.is_empty()
+    {
+        message.push_str(": headers=");
+        message.push_str(headers);
+    }
+    if let Some(body_excerpt) = body_excerpt
+        && !body_excerpt.is_empty()
+    {
+        message.push_str("; body=");
+        message.push_str(body_excerpt);
+    }
+    ManagedAcpToolError::invalid(message)
+}
+
+fn format_error_with_causes(error: &(dyn StdError + 'static)) -> String {
+    let mut segments = vec![error.to_string()];
+    let mut current = error.source();
+    while let Some(source) = current {
+        let message = source.to_string();
+        if !message.is_empty() && segments.last() != Some(&message) {
+            segments.push(message);
+        }
+        current = source.source();
+    }
+    segments.join(" | caused by: ")
+}
+
+fn summarize_response_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    const KEYS: &[&str] = &["server", "cf-ray", "via", "x-cache", "content-type"];
+    let mut parts = Vec::new();
+    for key in KEYS {
+        if let Some(value) = headers.get(*key).and_then(|value| value.to_str().ok()) {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(","))
+}
+
+async fn extract_response_body_excerpt(response: reqwest::Response) -> Option<String> {
+    let bytes = response.bytes().await.ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let excerpt = normalized.chars().take(240).collect::<String>();
+    (!excerpt.is_empty()).then_some(excerpt)
 }
 
 fn download_progress_message(url: &str, downloaded_bytes: u64, total_bytes: Option<u64>) -> String {
@@ -595,6 +816,7 @@ fn install_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
 
     #[test]
     fn manifest_url_uses_versioned_cdn_path() {
@@ -615,7 +837,10 @@ mod tests {
             npm_args_prefix: vec![],
             npx_path: PathBuf::from("/tmp/node/bin/npx"),
             npx_args_prefix: vec![],
-            env: vec![(std::ffi::OsString::from("PATH"), std::ffi::OsString::from("/tmp/node/bin"))],
+            env: vec![(
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from("/tmp/node/bin"),
+            )],
         };
         let tool = ResolvedManagedAcpTool {
             id: ManagedAcpToolId::CodexAcp,
@@ -626,7 +851,10 @@ mod tests {
         };
         let command = tool.command(&runtime);
         assert_eq!(command.program, PathBuf::from("/tmp/node/bin/node"));
-        assert_eq!(command.args_prefix, vec![std::ffi::OsString::from("/tmp/tool/dist/index.js")]);
+        assert_eq!(
+            command.args_prefix,
+            vec![std::ffi::OsString::from("/tmp/tool/dist/index.js")]
+        );
         let path = command
             .env
             .iter()
@@ -651,6 +879,43 @@ mod tests {
         let (kind, status_code) = classify_error(&error);
         assert_eq!(kind, ManagedAcpToolFailureKind::ChecksumMismatch);
         assert_eq!(status_code, None);
+    }
+
+    #[test]
+    fn format_error_with_causes_collects_nested_sources() {
+        #[derive(Debug)]
+        struct TestError {
+            message: &'static str,
+            source: Option<Box<dyn StdError + Send + Sync>>,
+        }
+
+        impl fmt::Display for TestError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.message)
+            }
+        }
+
+        impl StdError for TestError {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                self.source.as_deref().map(|error| error as &(dyn StdError + 'static))
+            }
+        }
+
+        let error = TestError {
+            message: "top level",
+            source: Some(Box::new(TestError {
+                message: "middle",
+                source: Some(Box::new(TestError {
+                    message: "root cause",
+                    source: None,
+                })),
+            })),
+        };
+
+        assert_eq!(
+            format_error_with_causes(&error),
+            "top level | caused by: middle | caused by: root cause"
+        );
     }
 
     #[test]

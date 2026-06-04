@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::cache;
+use crate::http_client;
 
 use super::types::{
     NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressReporter, NodeRuntimeSupport,
@@ -374,11 +375,8 @@ async fn install_archive(
 }
 
 fn build_http_client() -> Result<reqwest::Client, NodeRuntimeError> {
-    reqwest::Client::builder()
-        .connect_timeout(MANAGED_NODE_CONNECT_TIMEOUT)
-        .timeout(MANAGED_NODE_DOWNLOAD_TIMEOUT)
-        .build()
-        .map_err(|error| NodeRuntimeError::managed_invalid(format!("build http client: {error}")))
+    http_client::build_http_client(MANAGED_NODE_CONNECT_TIMEOUT, MANAGED_NODE_DOWNLOAD_TIMEOUT)
+        .map_err(NodeRuntimeError::managed_invalid)
 }
 
 async fn resolve_download_source(client: &reqwest::Client, spec: PlatformSpec) -> ManagedNodeDownloadSource {

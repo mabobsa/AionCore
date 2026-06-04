@@ -5,11 +5,11 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest,
-    EnsureManagedAcpToolRequest, EnsureManagedAcpToolResponse, EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse,
-    FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse,
-    ProviderResponse, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult,
-    UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
+    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureManagedAcpToolRequest,
+    EnsureManagedAcpToolResponse, EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FetchModelsAnonymousRequest,
+    FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
+    SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
+    UpdateProviderRequest, UpdateSettingsRequest,
 };
 use aionui_common::AppError;
 
