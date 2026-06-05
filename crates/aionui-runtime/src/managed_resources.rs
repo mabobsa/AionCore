@@ -18,6 +18,10 @@ pub struct ManagedResourceSource {
 const BUNDLED_RESOURCES_ENV: &str = "AIONUI_BUNDLED_MANAGED_RESOURCES";
 const DEV_LOCAL_RESOURCES_ENV: &str = "AIONUI_DEV_MANAGED_RESOURCES";
 
+pub fn bundled_root_path() -> Option<PathBuf> {
+    bundled_root().filter(|root| root.is_dir())
+}
+
 pub fn node_sources(directory_name: &str) -> Vec<ManagedResourceSource> {
     resource_roots()
         .into_iter()

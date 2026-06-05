@@ -336,6 +336,15 @@ async fn activate_local_runtime_source(
     reporter: Option<&dyn NodeRuntimeProgressReporter>,
 ) -> Result<Option<ResolvedNodeRuntime>, NodeRuntimeError> {
     let version_dir = runtime_root.join(spec.directory_name());
+    if let Some(bundled_root) = managed_resources::bundled_root_path() {
+        let bundled_runtime = bundled_root.join("node").join(spec.directory_name());
+        if !bundled_runtime.is_dir() {
+            return Err(NodeRuntimeError::managed_invalid(format!(
+                "bundled Node runtime missing under {}",
+                bundled_runtime.display()
+            )));
+        }
+    }
 
     for source in managed_resources::node_sources(&spec.directory_name()) {
         emit_progress(
