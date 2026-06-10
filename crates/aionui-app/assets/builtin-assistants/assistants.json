@@ -627,8 +627,7 @@
           "Витягти та узагальнити ключову інформацію з усіх файлів PDF"
         ]
       },
-      "models": [],
-      "skill_file": "skills/cowork-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "game-3d",
@@ -886,8 +885,7 @@
           "Створити пост про вакансію для кількох платформ (LinkedIn, X)"
         ]
       },
-      "models": [],
-      "skill_file": "skills/social-job-publisher-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "moltbook",
@@ -940,8 +938,7 @@
           "Перевірити нові особисті повідомлення"
         ]
       },
-      "models": [],
-      "skill_file": "skills/moltbook-skills.{locale}.md"
+      "models": []
     },
     {
       "id": "beautiful-mermaid",

@@ -1,5 +1,5 @@
 //! HTTP integration tests for `/api/assistants/*` plus the source-dispatched
-//! `/api/skills/assistant-rule/*` and `/api/skills/assistant-skill/*` trio.
+//! `/api/skills/assistant-rule/*` and user assistant-skill helpers.
 //!
 //! Each test exercises the router end-to-end via `tower::ServiceExt::oneshot`
 //! against a real `aionui_app::create_router_with_states` instance backed by
@@ -74,11 +74,9 @@ async fn fixture() -> Fixture {
     let builtin_assets_dir = builtin_tmp.path().join("assets");
     std::fs::create_dir_all(&builtin_assets_dir).unwrap();
 
-    // Builtin manifest: office has rule/skill/avatar on disk, bare has nothing.
+    // Builtin manifest: office has rule/avatar on disk, bare has nothing.
     std::fs::create_dir_all(builtin_assets_dir.join("rules")).unwrap();
-    std::fs::create_dir_all(builtin_assets_dir.join("skills")).unwrap();
     std::fs::write(builtin_assets_dir.join("rules/office.en-US.md"), "office rule body").unwrap();
-    std::fs::write(builtin_assets_dir.join("skills/office.en-US.md"), "office skill body").unwrap();
     // Tiny PNG-ish placeholder — content_type logic only inspects extension.
     std::fs::write(builtin_assets_dir.join("office.png"), b"not-a-real-png").unwrap();
 
@@ -90,7 +88,6 @@ async fn fixture() -> Fixture {
                 "name": "Office",
                 "preset_agent_type": "gemini",
                 "rule_file": "rules/office.{locale}.md",
-                "skill_file": "skills/office.{locale}.md",
                 "avatar": "office.png",
             },
             {
@@ -1062,7 +1059,7 @@ async fn delete_rule_extension_returns_400() {
 // ===========================================================================
 
 #[tokio::test]
-async fn read_skill_builtin_returns_manifest_file_contents() {
+async fn read_skill_builtin_returns_empty_string() {
     let fx = fixture().await;
     let req = json_with_token(
         "POST",
@@ -1074,7 +1071,7 @@ async fn read_skill_builtin_returns_manifest_file_contents() {
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"], "office skill body");
+    assert_eq!(json["data"], "");
 }
 
 #[tokio::test]

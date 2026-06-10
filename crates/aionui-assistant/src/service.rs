@@ -845,14 +845,7 @@ impl AssistantService {
 
     pub async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AssistantError> {
         match self.classify_source(id).await {
-            AssistantSource::Builtin => {
-                let locale = locale.unwrap_or("");
-                Ok(self
-                    .builtin
-                    .skill_bytes(id, locale)
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .unwrap_or_default())
-            }
+            AssistantSource::Builtin => Ok(String::new()),
             AssistantSource::Extension => Ok(String::new()),
             AssistantSource::User => {
                 let path = self.user_skill_path(id, locale);
@@ -1527,7 +1520,6 @@ mod tests {
                         "name": b.name,
                         "preset_agent_type": b.preset_agent_type,
                         "rule_file": b.rule_file,
-                        "skill_file": b.skill_file,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1601,7 +1593,6 @@ mod tests {
             custom_skill_names: Vec::new(),
             disabled_builtin_skills: Vec::new(),
             rule_file: None,
-            skill_file: None,
             prompts: Vec::new(),
             prompts_i18n: HashMap::new(),
             models: Vec::new(),
