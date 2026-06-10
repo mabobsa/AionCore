@@ -47,7 +47,8 @@ pub use agent_error::{
     AgentStreamErrorData,
 };
 pub use assistant::{
-    AssistantCapabilitiesResponse, AssistantDefaultListResponse, AssistantDefaultScalarResponse,
+    AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
+    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest,
     AssistantDefaultsResponse, AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse,
     AssistantProfileResponse, AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource,
     AssistantStateResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError,

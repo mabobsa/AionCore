@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AssistantCapabilitiesResponse, AssistantDefaultListResponse, AssistantDefaultScalarResponse,
+    AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
+    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest,
     AssistantDefaultsResponse, AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse,
     AssistantProfileResponse, AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource,
     AssistantStateResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError,
@@ -248,6 +249,102 @@ impl AssistantService {
         Ok(())
     }
 
+    async fn apply_detail_overrides(
+        &self,
+        assistant_id: &str,
+        overrides: SerializedDetailOverrides,
+    ) -> Result<(), AssistantError> {
+        if !overrides.has_changes() {
+            return Ok(());
+        }
+
+        let Some(existing) = self
+            .definition_repo
+            .get(assistant_id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("get assistant definition: {e}")))?
+        else {
+            return Ok(());
+        };
+
+        let mut patched = existing.clone();
+        if let Some(value) = overrides.recommended_prompts.as_deref() {
+            patched.recommended_prompts = value.to_string();
+        }
+        if let Some(value) = overrides.recommended_prompts_i18n.as_deref() {
+            patched.recommended_prompts_i18n = value.to_string();
+        }
+        if let Some(value) = overrides.default_model_mode.as_deref() {
+            patched.default_model_mode = value.to_string();
+        }
+        if let Some(value) = overrides.default_model_value {
+            patched.default_model_value = value;
+        }
+        if let Some(value) = overrides.default_permission_mode.as_deref() {
+            patched.default_permission_mode = value.to_string();
+        }
+        if let Some(value) = overrides.default_permission_value {
+            patched.default_permission_value = value;
+        }
+        if let Some(value) = overrides.default_skills_mode.as_deref() {
+            patched.default_skills_mode = value.to_string();
+        }
+        if let Some(value) = overrides.default_skill_ids.as_deref() {
+            patched.default_skill_ids = value.to_string();
+        }
+        if let Some(value) = overrides.default_mcps_mode.as_deref() {
+            patched.default_mcps_mode = value.to_string();
+        }
+        if let Some(value) = overrides.default_mcp_ids.as_deref() {
+            patched.default_mcp_ids = value.to_string();
+        }
+
+        let patched = self
+            .definition_repo
+            .upsert(&UpsertAssistantDefinitionParams {
+                id: &patched.id,
+                source: &patched.source,
+                owner_type: &patched.owner_type,
+                source_ref: patched.source_ref.as_deref(),
+                source_version: patched.source_version.as_deref(),
+                source_hash: patched.source_hash.as_deref(),
+                name: &patched.name,
+                name_i18n: &patched.name_i18n,
+                description: patched.description.as_deref(),
+                description_i18n: &patched.description_i18n,
+                avatar: patched.avatar.as_deref(),
+                agent_backend: &patched.agent_backend,
+                rule_resource_type: &patched.rule_resource_type,
+                rule_resource_ref: patched.rule_resource_ref.as_deref(),
+                rule_inline_content: patched.rule_inline_content.as_deref(),
+                recommended_prompts: &patched.recommended_prompts,
+                recommended_prompts_i18n: &patched.recommended_prompts_i18n,
+                default_model_mode: &patched.default_model_mode,
+                default_model_value: patched.default_model_value.as_deref(),
+                default_permission_mode: &patched.default_permission_mode,
+                default_permission_value: patched.default_permission_value.as_deref(),
+                default_skills_mode: &patched.default_skills_mode,
+                default_skill_ids: &patched.default_skill_ids,
+                custom_skill_names: &patched.custom_skill_names,
+                default_disabled_builtin_skill_ids: &patched.default_disabled_builtin_skill_ids,
+                default_mcps_mode: &patched.default_mcps_mode,
+                default_mcp_ids: &patched.default_mcp_ids,
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(format!("upsert patched assistant definition: {e}")))?;
+
+        let state = self
+            .state_repo
+            .get(assistant_id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("get assistant state: {e}")))?;
+        rebuild_legacy_assistant_mirror(&self.pool, &patched, state.as_ref())
+            .await
+            .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
+
+        Ok(())
+    }
+
     /// Rebuild downgrade-compatibility mirror rows from the new assistant tables.
     pub async fn rebuild_legacy_mirror_from_new_tables(&self) -> Result<(), AssistantError> {
         let states = self
@@ -433,6 +530,7 @@ impl AssistantService {
         }
 
         let serialized = SerializedFields::from_create(&req)?;
+        let detail_overrides = SerializedDetailOverrides::from_create(&req)?;
         // Resolve the default agent type from the configured provider list
         // when the caller did not supply one. Avoids the historical
         // `"gemini"` fallback that 400'd within 1 ms on machines without
@@ -459,6 +557,7 @@ impl AssistantService {
 
         let row = self.repo.create(&params).await?;
         self.upsert_definition_from_legacy_user_row(&row).await?;
+        self.apply_detail_overrides(&row.id, detail_overrides).await?;
         self.get(&id).await
     }
 
@@ -480,6 +579,9 @@ impl AssistantService {
                     || req.name_i18n.is_some()
                     || req.description_i18n.is_some()
                     || req.prompts_i18n.is_some()
+                    || req.recommended_prompts.is_some()
+                    || req.recommended_prompts_i18n.is_some()
+                    || req.defaults.is_some()
                 {
                     return Err(AssistantError::Forbidden(
                         "Only 'preset_agent_type' can be overridden on built-in assistants".into(),
@@ -526,6 +628,7 @@ impl AssistantService {
         }
 
         let serialized = SerializedFields::from_update(&req)?;
+        let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
         let params = UpdateAssistantParams {
             name: req.name.as_deref(),
             description: req.description.as_ref().map(|s| Some(s.as_str())),
@@ -547,6 +650,7 @@ impl AssistantService {
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
         self.upsert_definition_from_legacy_user_row(&row).await?;
+        self.apply_detail_overrides(id, detail_overrides).await?;
         self.get(id).await
     }
 
@@ -1294,12 +1398,129 @@ impl SerializedFields {
     }
 }
 
+#[derive(Default)]
+struct SerializedDetailOverrides {
+    recommended_prompts: Option<String>,
+    recommended_prompts_i18n: Option<String>,
+    default_model_mode: Option<String>,
+    default_model_value: Option<Option<String>>,
+    default_permission_mode: Option<String>,
+    default_permission_value: Option<Option<String>>,
+    default_skills_mode: Option<String>,
+    default_skill_ids: Option<String>,
+    default_mcps_mode: Option<String>,
+    default_mcp_ids: Option<String>,
+}
+
+impl SerializedDetailOverrides {
+    fn from_create(req: &CreateAssistantRequest) -> Result<Self, AssistantError> {
+        Self::from_parts(
+            req.recommended_prompts.as_deref(),
+            req.recommended_prompts_i18n.as_ref(),
+            req.defaults.as_ref(),
+        )
+    }
+
+    fn from_update(req: &UpdateAssistantRequest) -> Result<Self, AssistantError> {
+        Self::from_parts(
+            req.recommended_prompts.as_deref(),
+            req.recommended_prompts_i18n.as_ref(),
+            req.defaults.as_ref(),
+        )
+    }
+
+    fn from_parts(
+        recommended_prompts: Option<&[String]>,
+        recommended_prompts_i18n: Option<&HashMap<String, Vec<String>>>,
+        defaults: Option<&AssistantDefaultsRequest>,
+    ) -> Result<Self, AssistantError> {
+        let mut result = Self {
+            recommended_prompts: encode_str_list(recommended_prompts)?,
+            recommended_prompts_i18n: encode_list_map(recommended_prompts_i18n)?,
+            ..Default::default()
+        };
+
+        if let Some(defaults) = defaults {
+            if let Some(model) = defaults.model.as_ref() {
+                let (mode, value) = validate_scalar_default(model, "defaults.model")?;
+                result.default_model_mode = Some(mode);
+                result.default_model_value = Some(value);
+            }
+            if let Some(permission) = defaults.permission.as_ref() {
+                let (mode, value) = validate_scalar_default(permission, "defaults.permission")?;
+                result.default_permission_mode = Some(mode);
+                result.default_permission_value = Some(value);
+            }
+            if let Some(skills) = defaults.skills.as_ref() {
+                let (mode, value) = validate_list_default(skills, "defaults.skills")?;
+                result.default_skills_mode = Some(mode);
+                result.default_skill_ids = Some(value);
+            }
+            if let Some(mcps) = defaults.mcps.as_ref() {
+                let (mode, value) = validate_list_default(mcps, "defaults.mcps")?;
+                result.default_mcps_mode = Some(mode);
+                result.default_mcp_ids = Some(value);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn has_changes(&self) -> bool {
+        self.recommended_prompts.is_some()
+            || self.recommended_prompts_i18n.is_some()
+            || self.default_model_mode.is_some()
+            || self.default_model_value.is_some()
+            || self.default_permission_mode.is_some()
+            || self.default_permission_value.is_some()
+            || self.default_skills_mode.is_some()
+            || self.default_skill_ids.is_some()
+            || self.default_mcps_mode.is_some()
+            || self.default_mcp_ids.is_some()
+    }
+}
+
 fn encode_str_list(value: Option<&[String]>) -> Result<Option<String>, AssistantError> {
     match value {
         Some(v) => Ok(Some(
             serde_json::to_string(v).map_err(|e| AssistantError::Internal(format!("encode list: {e}")))?,
         )),
         None => Ok(None),
+    }
+}
+
+fn validate_scalar_default(
+    value: &AssistantDefaultScalarRequest,
+    field_name: &str,
+) -> Result<(String, Option<String>), AssistantError> {
+    match value.mode.as_str() {
+        "auto" => Ok(("auto".into(), None)),
+        "fixed" => {
+            let fixed = value.value.clone().filter(|v| !v.trim().is_empty()).ok_or_else(|| {
+                AssistantError::BadRequest(format!("{field_name}.value is required when mode='fixed'"))
+            })?;
+            Ok(("fixed".into(), Some(fixed)))
+        }
+        other => Err(AssistantError::BadRequest(format!(
+            "{field_name}.mode must be 'auto' or 'fixed', got '{other}'"
+        ))),
+    }
+}
+
+fn validate_list_default(
+    value: &AssistantDefaultListRequest,
+    field_name: &str,
+) -> Result<(String, String), AssistantError> {
+    match value.mode.as_str() {
+        "auto" => Ok(("auto".into(), "[]".into())),
+        "fixed" => Ok((
+            "fixed".into(),
+            serde_json::to_string(&value.value)
+                .map_err(|e| AssistantError::Internal(format!("encode {field_name}: {e}")))?,
+        )),
+        other => Err(AssistantError::BadRequest(format!(
+            "{field_name}.mode must be 'auto' or 'fixed', got '{other}'"
+        ))),
     }
 }
 
@@ -1789,6 +2010,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_persists_detail_defaults_and_recommended_prompts() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                recommended_prompts: Some(vec!["Write a plan".into(), "Summarize risks".into()]),
+                defaults: Some(AssistantDefaultsRequest {
+                    model: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("openai/gpt-5".into()),
+                    }),
+                    permission: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("default".into()),
+                    }),
+                    skills: Some(AssistantDefaultListRequest {
+                        mode: "fixed".into(),
+                        value: vec!["skill-a".into(), "skill-b".into()],
+                    }),
+                    mcps: Some(AssistantDefaultListRequest {
+                        mode: "fixed".into(),
+                        value: vec!["mcp-a".into()],
+                    }),
+                }),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        let detail = fx.service.get_detail("u1", Some("en-US")).await.unwrap();
+        assert_eq!(detail.prompts.recommended, vec!["Write a plan", "Summarize risks"]);
+        assert_eq!(detail.defaults.model.mode, "fixed");
+        assert_eq!(detail.defaults.model.value.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(detail.defaults.permission.mode, "fixed");
+        assert_eq!(detail.defaults.permission.value.as_deref(), Some("default"));
+        assert_eq!(detail.defaults.skills.mode, "fixed");
+        assert_eq!(detail.defaults.skills.value, vec!["skill-a", "skill-b"]);
+        assert_eq!(detail.defaults.mcps.mode, "fixed");
+        assert_eq!(detail.defaults.mcps.value, vec!["mcp-a"]);
+    }
+
+    #[tokio::test]
+    async fn update_persists_detail_defaults_and_recommended_prompts() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    recommended_prompts: Some(vec!["Start here".into()]),
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "auto".into(),
+                            value: None,
+                        }),
+                        permission: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("strict".into()),
+                        }),
+                        skills: Some(AssistantDefaultListRequest {
+                            mode: "fixed".into(),
+                            value: vec!["skill-z".into()],
+                        }),
+                        mcps: Some(AssistantDefaultListRequest {
+                            mode: "auto".into(),
+                            value: vec![],
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = fx.service.get_detail("u1", Some("en-US")).await.unwrap();
+        assert_eq!(detail.prompts.recommended, vec!["Start here"]);
+        assert_eq!(detail.defaults.model.mode, "auto");
+        assert_eq!(detail.defaults.model.value, None);
+        assert_eq!(detail.defaults.permission.mode, "fixed");
+        assert_eq!(detail.defaults.permission.value.as_deref(), Some("strict"));
+        assert_eq!(detail.defaults.skills.mode, "fixed");
+        assert_eq!(detail.defaults.skills.value, vec!["skill-z"]);
+        assert_eq!(detail.defaults.mcps.mode, "auto");
+        assert!(detail.defaults.mcps.value.is_empty());
+    }
+
+    #[tokio::test]
     async fn delete_user_removes_row_and_override() {
         let fx = fixture().await;
         fx.service
@@ -2242,6 +2559,9 @@ mod tests {
             name_i18n: None,
             description_i18n: None,
             prompts_i18n: None,
+            recommended_prompts: None,
+            recommended_prompts_i18n: None,
+            defaults: None,
         }
     }
 }

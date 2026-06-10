@@ -113,6 +113,32 @@ pub struct AssistantDefaultListResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultScalarRequest {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultListRequest {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AssistantDefaultsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<AssistantDefaultScalarRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<AssistantDefaultScalarRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<AssistantDefaultListRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcps: Option<AssistantDefaultListRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantDefaultsResponse {
     pub model: AssistantDefaultScalarResponse,
     pub permission: AssistantDefaultScalarResponse,
@@ -190,6 +216,12 @@ pub struct CreateAssistantRequest {
     pub description_i18n: Option<HashMap<String, String>>,
     #[serde(default)]
     pub prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub recommended_prompts: Option<Vec<String>>,
+    #[serde(default)]
+    pub recommended_prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub defaults: Option<AssistantDefaultsRequest>,
 }
 
 /// `PUT /api/assistants/{id}`. All fields optional; partial update semantics.
@@ -219,6 +251,12 @@ pub struct UpdateAssistantRequest {
     pub description_i18n: Option<HashMap<String, String>>,
     #[serde(default)]
     pub prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub recommended_prompts: Option<Vec<String>>,
+    #[serde(default)]
+    pub recommended_prompts_i18n: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub defaults: Option<AssistantDefaultsRequest>,
 }
 
 /// `PATCH /api/assistants/{id}/state`. Upserts `assistant_overrides`.
@@ -307,6 +345,7 @@ mod tests {
         assert_eq!(req.name, "X");
         assert!(req.id.is_none());
         assert!(req.preset_agent_type.is_none());
+        assert!(req.defaults.is_none());
     }
 
     #[test]
@@ -315,6 +354,24 @@ mod tests {
         let req: UpdateAssistantRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("renamed"));
         assert!(req.description.is_none());
+        assert!(req.defaults.is_none());
+    }
+
+    #[test]
+    fn create_request_accepts_defaults_and_recommended_prompts() {
+        let json = serde_json::json!({
+            "name": "planner",
+            "recommended_prompts": ["Plan work"],
+            "defaults": {
+                "model": { "mode": "fixed", "value": "openai/gpt-5" },
+                "skills": { "mode": "fixed", "value": ["skill-a"] }
+            }
+        });
+        let req: CreateAssistantRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.recommended_prompts.unwrap(), vec!["Plan work"]);
+        let defaults = req.defaults.unwrap();
+        assert_eq!(defaults.model.unwrap().mode, "fixed");
+        assert_eq!(defaults.skills.unwrap().value, vec!["skill-a"]);
     }
 
     #[test]
