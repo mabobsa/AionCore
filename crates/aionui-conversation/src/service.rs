@@ -25,8 +25,10 @@ use aionui_common::{
 use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IConversationRepository, IMcpServerRepository, SaveRuntimeStateParams, SortOrder,
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantPreferenceRepository,
+    IAssistantStateRepository, IConversationRepository, IMcpServerRepository, SaveRuntimeStateParams, SortOrder,
 };
+use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
@@ -47,6 +49,53 @@ use std::sync::RwLock;
 pub(crate) const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct AssistantConversationOverrides {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    permission: Option<String>,
+    #[serde(default)]
+    skill_ids: Option<Vec<String>>,
+    #[serde(default)]
+    disabled_builtin_skill_ids: Option<Vec<String>>,
+    #[serde(default)]
+    mcp_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AssistantSnapshotResolvedDefaults {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    permission: Option<String>,
+    #[serde(default)]
+    skill_ids: Vec<String>,
+    #[serde(default)]
+    disabled_builtin_skill_ids: Vec<String>,
+    #[serde(default)]
+    mcp_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AssistantSnapshotRules {
+    content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AssistantSnapshot {
+    assistant_id: String,
+    assistant_source: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    avatar: Option<String>,
+    agent_backend: String,
+    rules: AssistantSnapshotRules,
+    resolved_defaults: AssistantSnapshotResolvedDefaults,
+    created_at: i64,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct McpSupportPolicy {
@@ -131,6 +180,10 @@ pub struct ConversationService {
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
     cron_service: Arc<RwLock<Option<Arc<dyn ICronService>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
+    assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
+    assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantStateRepository>>>>,
+    assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
+    assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
 
     // Repos for conversation, acp_session and agent_metadata access.
@@ -160,6 +213,10 @@ impl ConversationService {
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             cron_service: Arc::new(RwLock::new(None)),
             mcp_server_repo: Arc::new(RwLock::new(None)),
+            assistant_definition_repo: Arc::new(RwLock::new(None)),
+            assistant_state_repo: Arc::new(RwLock::new(None)),
+            assistant_preference_repo: Arc::new(RwLock::new(None)),
+            assistant_dispatcher: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
 
             conversation_repo,
@@ -182,6 +239,30 @@ impl ConversationService {
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
             *guard = Some(repo);
+        }
+    }
+
+    pub fn with_assistant_definition_repo(&self, repo: Arc<dyn IAssistantDefinitionRepository>) {
+        if let Ok(mut guard) = self.assistant_definition_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub fn with_assistant_state_repo(&self, repo: Arc<dyn IAssistantStateRepository>) {
+        if let Ok(mut guard) = self.assistant_state_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub fn with_assistant_preference_repo(&self, repo: Arc<dyn IAssistantPreferenceRepository>) {
+        if let Ok(mut guard) = self.assistant_preference_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub fn with_assistant_dispatcher(&self, dispatcher: Arc<dyn AssistantRuleDispatcher>) {
+        if let Ok(mut guard) = self.assistant_dispatcher.write() {
+            *guard = Some(dispatcher);
         }
     }
 
@@ -228,6 +309,34 @@ impl ConversationService {
 
     pub fn runtime_state(&self) -> Arc<ConversationRuntimeStateService> {
         self.runtime_state.clone()
+    }
+
+    fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
+        self.assistant_definition_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn assistant_state_repo(&self) -> Option<Arc<dyn IAssistantStateRepository>> {
+        self.assistant_state_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn assistant_preference_repo(&self) -> Option<Arc<dyn IAssistantPreferenceRepository>> {
+        self.assistant_preference_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
+        self.assistant_dispatcher
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
     }
 
     pub(crate) fn runtime_persistence(&self) -> RuntimePersistenceCoordinator {
@@ -388,6 +497,70 @@ impl ConversationService {
             obj.remove("custom_workspace");
         }
 
+        let (assistant_id, assistant_locale, assistant_overrides) = match extra.as_object_mut() {
+            Some(obj) => {
+                let assistant_id = obj
+                    .remove("assistant_id")
+                    .or_else(|| obj.get("preset_assistant_id").cloned())
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned));
+                let assistant_locale = obj
+                    .remove("assistant_locale")
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned));
+                let overrides = obj
+                    .remove("assistant_overrides")
+                    .map(serde_json::from_value::<AssistantConversationOverrides>)
+                    .transpose()
+                    .map_err(|e| ConversationError::BadRequest {
+                        reason: format!("Invalid assistant_overrides: {e}"),
+                    })?
+                    .unwrap_or_default();
+                (assistant_id, assistant_locale, overrides)
+            }
+            None => (None, None, AssistantConversationOverrides::default()),
+        };
+        let assistant_snapshot = match assistant_id.as_deref() {
+            Some(id) => {
+                self.resolve_assistant_snapshot(id, assistant_locale.as_deref(), &assistant_overrides, &extra)
+                    .await?
+            }
+            None => None,
+        };
+        if let Some(snapshot) = assistant_snapshot.as_ref()
+            && let Some(obj) = extra.as_object_mut()
+        {
+            obj.insert(
+                "assistant_id".to_owned(),
+                serde_json::Value::String(snapshot.assistant_id.clone()),
+            );
+            obj.insert(
+                "assistant_snapshot".to_owned(),
+                serde_json::to_value(snapshot)
+                    .map_err(|e| ConversationError::internal(format!("Failed to serialize assistant snapshot: {e}")))?,
+            );
+            obj.insert(
+                "preset_assistant_id".to_owned(),
+                serde_json::Value::String(snapshot.assistant_id.clone()),
+            );
+            if !snapshot.rules.content.is_empty() {
+                obj.insert(
+                    "preset_context".to_owned(),
+                    serde_json::Value::String(snapshot.rules.content.clone()),
+                );
+                obj.insert(
+                    "preset_rules".to_owned(),
+                    serde_json::Value::String(snapshot.rules.content.clone()),
+                );
+            }
+            if let Some(model_id) = snapshot.resolved_defaults.model.as_ref()
+                && !obj.contains_key("current_model_id")
+            {
+                obj.insert(
+                    "current_model_id".to_owned(),
+                    serde_json::Value::String(model_id.clone()),
+                );
+            }
+        }
+
         // Consume transient skill-shaping inputs and freeze the initial
         // `skills` snapshot into `extra.skills`. These request-only fields
         // must not land in the stored row. Legacy names (`enabled_skills`,
@@ -406,8 +579,16 @@ impl ConversationService {
 
         let (preset_enabled, exclude_auto_inject) = match extra.as_object_mut() {
             Some(obj) => {
-                let preset = take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]);
-                let exclude = take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"]);
+                let preset = assistant_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.resolved_defaults.skill_ids.clone())
+                    .unwrap_or_else(|| take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]));
+                let exclude = assistant_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.resolved_defaults.disabled_builtin_skill_ids.clone())
+                    .unwrap_or_else(|| {
+                        take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"])
+                    });
                 // Strip the stale cache field if a clone copied it in.
                 obj.remove("loaded_skills");
                 (preset, exclude)
@@ -455,7 +636,14 @@ impl ConversationService {
             Some(obj) => {
                 let has_selection = obj.contains_key("selected_mcp_server_ids");
                 let ids = take_string_array(obj, &["selected_mcp_server_ids"]);
-                if has_selection { Some(ids) } else { None }
+                if has_selection {
+                    Some(ids)
+                } else {
+                    assistant_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.resolved_defaults.mcp_ids.clone())
+                        .filter(|ids| !ids.is_empty())
+                }
             }
             None => None,
         };
@@ -583,6 +771,11 @@ impl ConversationService {
             self.create_acp_session_row(&id, &extra).await?;
         }
 
+        if let Some(snapshot) = assistant_snapshot.as_ref() {
+            self.persist_assistant_preferences_from_snapshot(&snapshot.assistant_id, snapshot)
+                .await?;
+        }
+
         let response = row_to_response(row, &self.workspace_root)?;
 
         self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
@@ -662,6 +855,193 @@ impl ConversationService {
                 .await
                 .map_err(|e| ConversationError::internal(format!("Failed to seed acp_session runtime state: {e}")))?;
         }
+        Ok(())
+    }
+
+    async fn resolve_assistant_snapshot(
+        &self,
+        assistant_id: &str,
+        locale: Option<&str>,
+        overrides: &AssistantConversationOverrides,
+        extra: &serde_json::Value,
+    ) -> Result<Option<AssistantSnapshot>, ConversationError> {
+        let (Some(definition_repo), Some(state_repo), Some(preference_repo)) = (
+            self.assistant_definition_repo(),
+            self.assistant_state_repo(),
+            self.assistant_preference_repo(),
+        ) else {
+            return Ok(None);
+        };
+
+        let Some(definition) = definition_repo
+            .get(assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
+        else {
+            return Ok(None);
+        };
+
+        let state = state_repo
+            .get(assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("assistant state lookup failed: {e}")))?;
+        let preference = preference_repo
+            .get(assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
+
+        let skill_ids = match overrides.skill_ids.as_ref() {
+            Some(value) => value.clone(),
+            None if definition.default_skills_mode == "fixed" => {
+                parse_json_string_list(Some(definition.default_skill_ids.as_str()), "default_skill_ids")?
+            }
+            None => preference
+                .as_ref()
+                .map(|row| parse_json_string_list(Some(row.last_skill_ids.as_str()), "last_skill_ids"))
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        let disabled_builtin_skill_ids = match overrides.disabled_builtin_skill_ids.as_ref() {
+            Some(value) => value.clone(),
+            None if definition.default_skills_mode == "fixed" => parse_json_string_list(
+                Some(definition.default_disabled_builtin_skill_ids.as_str()),
+                "default_disabled_builtin_skill_ids",
+            )?,
+            None => preference
+                .as_ref()
+                .map(|row| {
+                    parse_json_string_list(
+                        Some(row.last_disabled_builtin_skill_ids.as_str()),
+                        "last_disabled_builtin_skill_ids",
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        let mcp_ids = match overrides.mcp_ids.as_ref() {
+            Some(value) => value.clone(),
+            None if definition.default_mcps_mode == "fixed" => {
+                parse_json_string_list(Some(definition.default_mcp_ids.as_str()), "default_mcp_ids")?
+            }
+            None => preference
+                .as_ref()
+                .map(|row| parse_json_string_list(Some(row.last_mcp_ids.as_str()), "last_mcp_ids"))
+                .transpose()?
+                .unwrap_or_default(),
+        };
+
+        let model = overrides
+            .model
+            .clone()
+            .or_else(|| match definition.default_model_mode.as_str() {
+                "fixed" => definition.default_model_value.clone(),
+                _ => preference.as_ref().and_then(|row| row.last_model_id.clone()),
+            });
+        let permission = overrides
+            .permission
+            .clone()
+            .or_else(|| match definition.default_permission_mode.as_str() {
+                "fixed" => definition.default_permission_value.clone(),
+                _ => preference.as_ref().and_then(|row| row.last_permission_value.clone()),
+            });
+
+        let rules_content = if let Some(dispatcher) = self.assistant_dispatcher() {
+            dispatcher
+                .read_rule(assistant_id, locale)
+                .await
+                .map_err(|e| ConversationError::internal(format!("assistant rule lookup failed: {e}")))?
+        } else {
+            String::new()
+        };
+        let fallback_rules = extra
+            .get("preset_context")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| extra.get("preset_rules").and_then(serde_json::Value::as_str))
+            .unwrap_or_default();
+        let agent_backend = state
+            .as_ref()
+            .and_then(|row| row.agent_backend_override.clone())
+            .unwrap_or_else(|| definition.agent_backend.clone());
+
+        Ok(Some(AssistantSnapshot {
+            assistant_id: assistant_id.to_owned(),
+            assistant_source: definition.source,
+            name: definition.name,
+            avatar: definition.avatar,
+            agent_backend,
+            rules: AssistantSnapshotRules {
+                content: if rules_content.is_empty() {
+                    fallback_rules.to_owned()
+                } else {
+                    rules_content
+                },
+            },
+            resolved_defaults: AssistantSnapshotResolvedDefaults {
+                model,
+                permission,
+                skill_ids,
+                disabled_builtin_skill_ids,
+                mcp_ids,
+            },
+            created_at: now_ms(),
+        }))
+    }
+
+    async fn persist_assistant_preferences_from_snapshot(
+        &self,
+        assistant_id: &str,
+        snapshot: &AssistantSnapshot,
+    ) -> Result<(), ConversationError> {
+        let (Some(definition_repo), Some(preference_repo)) =
+            (self.assistant_definition_repo(), self.assistant_preference_repo())
+        else {
+            return Ok(());
+        };
+        let Some(definition) = definition_repo
+            .get(assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
+        else {
+            return Ok(());
+        };
+
+        let last_model_id = (definition.default_model_mode == "auto")
+            .then_some(snapshot.resolved_defaults.model.as_deref())
+            .flatten();
+        let last_permission_value = (definition.default_permission_mode == "auto")
+            .then_some(snapshot.resolved_defaults.permission.as_deref())
+            .flatten();
+        let last_skill_ids = if definition.default_skills_mode == "auto" {
+            serde_json::to_string(&snapshot.resolved_defaults.skill_ids)
+                .map_err(|e| ConversationError::internal(format!("encode assistant skills: {e}")))?
+        } else {
+            definition.default_skill_ids.clone()
+        };
+        let last_disabled_builtin_skill_ids = if definition.default_skills_mode == "auto" {
+            serde_json::to_string(&snapshot.resolved_defaults.disabled_builtin_skill_ids)
+                .map_err(|e| ConversationError::internal(format!("encode assistant disabled builtin skills: {e}")))?
+        } else {
+            definition.default_disabled_builtin_skill_ids.clone()
+        };
+        let last_mcp_ids = if definition.default_mcps_mode == "auto" {
+            serde_json::to_string(&snapshot.resolved_defaults.mcp_ids)
+                .map_err(|e| ConversationError::internal(format!("encode assistant mcps: {e}")))?
+        } else {
+            definition.default_mcp_ids.clone()
+        };
+
+        preference_repo
+            .upsert(&aionui_db::UpsertAssistantPreferenceParams {
+                assistant_id,
+                last_model_id,
+                last_permission_value,
+                last_skill_ids: &last_skill_ids,
+                last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids,
+                last_mcp_ids: &last_mcp_ids,
+            })
+            .await
+            .map_err(|e| ConversationError::internal(format!("assistant preference upsert failed: {e}")))?;
+
         Ok(())
     }
 
@@ -2300,6 +2680,14 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
         for (key, value) in patch_obj {
             base_obj.insert(key.clone(), value.clone());
         }
+    }
+}
+
+fn parse_json_string_list(raw: Option<&str>, field: &str) -> Result<Vec<String>, ConversationError> {
+    match raw {
+        Some(value) if !value.trim().is_empty() => serde_json::from_str(value)
+            .map_err(|e| ConversationError::internal(format!("failed to parse assistant field {field}: {e}"))),
+        _ => Ok(Vec::new()),
     }
 }
 

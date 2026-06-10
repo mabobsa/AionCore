@@ -19,8 +19,8 @@ pub use acp_session::AcpSessionRow;
 pub use agent_metadata::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
 pub use assistant::{
     AssistantDefinitionRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, AssistantStateRow,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantPreferenceParams, UpsertAssistantStateParams, UpsertOverrideParams,
+    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantPreferenceParams,
+    UpsertAssistantStateParams, UpsertOverrideParams,
 };
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;

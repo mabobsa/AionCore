@@ -6,8 +6,8 @@ use sqlx::SqlitePool;
 use crate::error::DbError;
 use crate::models::{
     AssistantDefinitionRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, AssistantStateRow,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantPreferenceParams, UpsertAssistantStateParams, UpsertOverrideParams,
+    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantPreferenceParams,
+    UpsertAssistantStateParams, UpsertOverrideParams,
 };
 use crate::repository::assistant::{
     IAssistantDefinitionRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
@@ -384,10 +384,7 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         Ok(row)
     }
 
-    async fn upsert(
-        &self,
-        params: &UpsertAssistantDefinitionParams<'_>,
-    ) -> Result<AssistantDefinitionRow, DbError> {
+    async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
         let now = now_ms();
 
         sqlx::query(
@@ -493,9 +490,10 @@ impl IAssistantStateRepository for SqliteAssistantStateRepository {
     }
 
     async fn list(&self) -> Result<Vec<AssistantStateRow>, DbError> {
-        let rows = sqlx::query_as::<_, AssistantStateRow>("SELECT * FROM assistant_states ORDER BY sort_order, updated_at")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query_as::<_, AssistantStateRow>("SELECT * FROM assistant_states ORDER BY sort_order, updated_at")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
@@ -522,9 +520,12 @@ impl IAssistantStateRepository for SqliteAssistantStateRepository {
         .execute(&self.pool)
         .await?;
 
-        self.get(params.assistant_id)
-            .await?
-            .ok_or_else(|| DbError::Init(format!("upsert did not produce state row for id '{}'", params.assistant_id)))
+        self.get(params.assistant_id).await?.ok_or_else(|| {
+            DbError::Init(format!(
+                "upsert did not produce state row for id '{}'",
+                params.assistant_id
+            ))
+        })
     }
 
     async fn delete(&self, assistant_id: &str) -> Result<bool, DbError> {
@@ -547,10 +548,7 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
         Ok(row)
     }
 
-    async fn upsert(
-        &self,
-        params: &UpsertAssistantPreferenceParams<'_>,
-    ) -> Result<AssistantPreferenceRow, DbError> {
+    async fn upsert(&self, params: &UpsertAssistantPreferenceParams<'_>) -> Result<AssistantPreferenceRow, DbError> {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_preferences (

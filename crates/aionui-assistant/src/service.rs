@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AssistantResponse, AssistantSource, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult,
-    ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+    AssistantCapabilitiesResponse, AssistantDefaultListResponse, AssistantDefaultScalarResponse,
+    AssistantDefaultsResponse, AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse,
+    AssistantProfileResponse, AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource,
+    AssistantStateResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError,
+    SetAssistantStateRequest, UpdateAssistantRequest,
 };
 use aionui_common::now_ms;
 use aionui_db::{
@@ -22,9 +25,9 @@ use aionui_extension::{
 use serde_json;
 use tracing::{debug, warn};
 
-use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry};
 #[cfg(test)]
 use crate::builtin::BuiltinAssistant;
+use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry};
 use crate::error::AssistantError;
 
 /// Aggregated business logic for `/api/assistants/*` and rule/skill dispatch.
@@ -32,7 +35,7 @@ pub struct AssistantService {
     pool: SqlitePool,
     definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     state_repo: Arc<dyn IAssistantStateRepository>,
-    _preference_repo: Arc<dyn IAssistantPreferenceRepository>,
+    preference_repo: Arc<dyn IAssistantPreferenceRepository>,
     repo: Arc<dyn IAssistantRepository>,
     override_repo: Arc<dyn IAssistantOverrideRepository>,
     /// Used to infer a sane `preset_agent_type` default when the caller did
@@ -79,7 +82,7 @@ impl AssistantService {
             pool,
             definition_repo,
             state_repo,
-            _preference_repo: preference_repo,
+            preference_repo,
             repo,
             override_repo,
             provider_repo,
@@ -114,10 +117,8 @@ impl AssistantService {
                 .map_err(|e| AssistantError::Internal(format!("encode builtin skills: {e}")))?;
             let custom_skill_names = serde_json::to_string(&builtin.custom_skill_names)
                 .map_err(|e| AssistantError::Internal(format!("encode builtin custom skills: {e}")))?;
-            let default_disabled_builtin_skill_ids =
-                serde_json::to_string(&builtin.disabled_builtin_skills).map_err(|e| {
-                    AssistantError::Internal(format!("encode builtin disabled skills: {e}"))
-                })?;
+            let default_disabled_builtin_skill_ids = serde_json::to_string(&builtin.disabled_builtin_skills)
+                .map_err(|e| AssistantError::Internal(format!("encode builtin disabled skills: {e}")))?;
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
@@ -197,14 +198,12 @@ impl AssistantService {
 
     async fn upsert_definition_from_legacy_user_row(&self, row: &AssistantRow) -> Result<(), AssistantError> {
         let name_i18n = normalize_json_object_string(row.name_i18n.as_deref(), "name_i18n")?;
-        let description_i18n =
-            normalize_json_object_string(row.description_i18n.as_deref(), "description_i18n")?;
+        let description_i18n = normalize_json_object_string(row.description_i18n.as_deref(), "description_i18n")?;
         let recommended_prompts = normalize_json_array_string(row.prompts.as_deref(), "prompts")?;
         let recommended_prompts_i18n =
             normalize_json_map_of_arrays_string(row.prompts_i18n.as_deref(), "prompts_i18n")?;
         let default_skill_ids = normalize_json_array_string(row.enabled_skills.as_deref(), "enabled_skills")?;
-        let custom_skill_names =
-            normalize_json_array_string(row.custom_skill_names.as_deref(), "custom_skill_names")?;
+        let custom_skill_names = normalize_json_array_string(row.custom_skill_names.as_deref(), "custom_skill_names")?;
         let default_disabled_builtin_skill_ids =
             normalize_json_array_string(row.disabled_builtin_skills.as_deref(), "disabled_builtin_skills")?;
         let models = decode_str_list(row.models.as_deref())?;
@@ -256,8 +255,10 @@ impl AssistantService {
             .list()
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant states: {e}")))?;
-        let state_map: HashMap<String, aionui_db::AssistantStateRow> =
-            states.into_iter().map(|state| (state.assistant_id.clone(), state)).collect();
+        let state_map: HashMap<String, aionui_db::AssistantStateRow> = states
+            .into_iter()
+            .map(|state| (state.assistant_id.clone(), state))
+            .collect();
 
         for definition in self
             .definition_repo
@@ -307,8 +308,10 @@ impl AssistantService {
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant states: {e}")))?;
         let extensions = self.extension_registry.get_assistants().await;
-        let state_map: HashMap<String, AssistantStateRow> =
-            states.into_iter().map(|state| (state.assistant_id.clone(), state)).collect();
+        let state_map: HashMap<String, AssistantStateRow> = states
+            .into_iter()
+            .map(|state| (state.assistant_id.clone(), state))
+            .collect();
 
         let mut result = Vec::new();
 
@@ -344,6 +347,21 @@ impl AssistantService {
 
         if let Some(assistant) = self.extension_registry.get_assistant_by_id(id).await {
             return Ok(extension_to_response(&assistant));
+        }
+
+        Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
+    }
+
+    pub async fn get_detail(&self, id: &str, locale: Option<&str>) -> Result<AssistantDetailResponse, AssistantError> {
+        if let Some(definition) = self.definition_repo.get(id).await? {
+            let state = self.state_repo.get(id).await?;
+            let preference = self.preference_repo.get(id).await?;
+            let rules_content = self.read_rule(id, locale).await?;
+            return definition_to_detail_response(&definition, state.as_ref(), preference.as_ref(), &rules_content);
+        }
+
+        if let Some(assistant) = self.extension_registry.get_assistant_by_id(id).await {
+            return Ok(extension_to_detail_response(&assistant));
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
@@ -557,7 +575,7 @@ impl AssistantService {
         if let Err(e) = self.state_repo.delete(id).await {
             warn!("failed to remove assistant state for deleted assistant '{id}': {e}");
         }
-        if let Err(e) = self._preference_repo.delete(id).await {
+        if let Err(e) = self.preference_repo.delete(id).await {
             warn!("failed to remove assistant preferences for deleted assistant '{id}': {e}");
         }
         if let Err(e) = self.definition_repo.soft_delete(id, now_ms()).await {
@@ -591,14 +609,12 @@ impl AssistantService {
         // Merge with existing state/override to preserve fields not in this request.
         let existing_state = self.state_repo.get(id).await?;
         let existing = self.override_repo.get(id).await?;
-        let enabled = req
-            .enabled
-            .unwrap_or_else(|| {
-                existing_state
-                    .as_ref()
-                    .map(|state| state.enabled)
-                    .unwrap_or_else(|| existing.as_ref().is_none_or(|o| o.enabled))
-            });
+        let enabled = req.enabled.unwrap_or_else(|| {
+            existing_state
+                .as_ref()
+                .map(|state| state.enabled)
+                .unwrap_or_else(|| existing.as_ref().is_none_or(|o| o.enabled))
+        });
         let sort_order = req
             .sort_order
             .or_else(|| existing_state.as_ref().map(|state| state.sort_order))
@@ -1063,6 +1079,99 @@ fn definition_to_response(
     })
 }
 
+fn definition_to_detail_response(
+    definition: &AssistantDefinitionRow,
+    state: Option<&AssistantStateRow>,
+    preference: Option<&aionui_db::AssistantPreferenceRow>,
+    rules_content: &str,
+) -> Result<AssistantDetailResponse, AssistantError> {
+    let default_skill_ids = decode_str_list(Some(definition.default_skill_ids.as_str()))?;
+    let custom_skill_names = decode_str_list(Some(definition.custom_skill_names.as_str()))?;
+    let default_disabled_builtin_skill_ids =
+        decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?;
+    let default_mcp_ids = decode_str_list(Some(definition.default_mcp_ids.as_str()))?;
+    let last_skill_ids = preference
+        .map(|row| decode_str_list(Some(row.last_skill_ids.as_str())))
+        .transpose()?
+        .unwrap_or_default();
+    let last_disabled_builtin_skill_ids = preference
+        .map(|row| decode_str_list(Some(row.last_disabled_builtin_skill_ids.as_str())))
+        .transpose()?
+        .unwrap_or_default();
+    let last_mcp_ids = preference
+        .map(|row| decode_str_list(Some(row.last_mcp_ids.as_str())))
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(AssistantDetailResponse {
+        id: definition.id.clone(),
+        source: match definition.source.as_str() {
+            "builtin" => AssistantSource::Builtin,
+            "extension" => AssistantSource::Extension,
+            _ => AssistantSource::User,
+        },
+        profile: AssistantProfileResponse {
+            name: definition.name.clone(),
+            name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
+            description: definition.description.clone(),
+            description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
+            avatar: definition.avatar.clone(),
+        },
+        state: AssistantStateResponse {
+            enabled: state.map(|row| row.enabled).unwrap_or(true),
+            sort_order: state.map(|row| row.sort_order).unwrap_or_default(),
+            last_used_at: state.and_then(|row| row.last_used_at),
+        },
+        engine: AssistantEngineResponse {
+            agent_backend: state
+                .and_then(|row| row.agent_backend_override.clone())
+                .unwrap_or_else(|| definition.agent_backend.clone()),
+        },
+        rules: AssistantRulesResponse {
+            content: if rules_content.is_empty() {
+                definition.rule_inline_content.clone().unwrap_or_default()
+            } else {
+                rules_content.to_owned()
+            },
+            storage_mode: definition.rule_resource_type.clone(),
+        },
+        prompts: AssistantPromptsResponse {
+            recommended: decode_str_list(Some(definition.recommended_prompts.as_str()))?,
+            recommended_i18n: decode_list_map(Some(definition.recommended_prompts_i18n.as_str()))?,
+        },
+        defaults: AssistantDefaultsResponse {
+            model: AssistantDefaultScalarResponse {
+                mode: definition.default_model_mode.clone(),
+                value: definition.default_model_value.clone(),
+            },
+            permission: AssistantDefaultScalarResponse {
+                mode: definition.default_permission_mode.clone(),
+                value: definition.default_permission_value.clone(),
+            },
+            skills: AssistantDefaultListResponse {
+                mode: definition.default_skills_mode.clone(),
+                value: default_skill_ids.clone(),
+            },
+            mcps: AssistantDefaultListResponse {
+                mode: definition.default_mcps_mode.clone(),
+                value: default_mcp_ids,
+            },
+        },
+        capabilities: AssistantCapabilitiesResponse {
+            default_skill_ids,
+            custom_skill_names,
+            default_disabled_builtin_skill_ids,
+        },
+        preferences: AssistantPreferencesResponse {
+            last_model_id: preference.and_then(|row| row.last_model_id.clone()),
+            last_permission_value: preference.and_then(|row| row.last_permission_value.clone()),
+            last_skill_ids,
+            last_disabled_builtin_skill_ids,
+            last_mcp_ids,
+        },
+    })
+}
+
 fn extension_to_response(e: &ResolvedAssistant) -> AssistantResponse {
     AssistantResponse {
         id: e.id.clone(),
@@ -1084,6 +1193,66 @@ fn extension_to_response(e: &ResolvedAssistant) -> AssistantResponse {
         prompts_i18n: HashMap::new(),
         models: Vec::new(),
         last_used_at: None,
+    }
+}
+
+fn extension_to_detail_response(e: &ResolvedAssistant) -> AssistantDetailResponse {
+    AssistantDetailResponse {
+        id: e.id.clone(),
+        source: AssistantSource::Extension,
+        profile: AssistantProfileResponse {
+            name: e.name.clone(),
+            name_i18n: HashMap::new(),
+            description: e.description.clone(),
+            description_i18n: HashMap::new(),
+            avatar: e.icon.clone(),
+        },
+        state: AssistantStateResponse {
+            enabled: true,
+            sort_order: 0,
+            last_used_at: None,
+        },
+        engine: AssistantEngineResponse {
+            agent_backend: DEFAULT_AGENT_TYPE.to_string(),
+        },
+        rules: AssistantRulesResponse {
+            content: e.context.clone().unwrap_or_default(),
+            storage_mode: "extension".to_string(),
+        },
+        prompts: AssistantPromptsResponse {
+            recommended: Vec::new(),
+            recommended_i18n: HashMap::new(),
+        },
+        defaults: AssistantDefaultsResponse {
+            model: AssistantDefaultScalarResponse {
+                mode: "auto".to_string(),
+                value: None,
+            },
+            permission: AssistantDefaultScalarResponse {
+                mode: "auto".to_string(),
+                value: None,
+            },
+            skills: AssistantDefaultListResponse {
+                mode: "auto".to_string(),
+                value: Vec::new(),
+            },
+            mcps: AssistantDefaultListResponse {
+                mode: "auto".to_string(),
+                value: Vec::new(),
+            },
+        },
+        capabilities: AssistantCapabilitiesResponse {
+            default_skill_ids: Vec::new(),
+            custom_skill_names: Vec::new(),
+            default_disabled_builtin_skill_ids: Vec::new(),
+        },
+        preferences: AssistantPreferencesResponse {
+            last_model_id: None,
+            last_permission_value: None,
+            last_skill_ids: Vec::new(),
+            last_disabled_builtin_skill_ids: Vec::new(),
+            last_mcp_ids: Vec::new(),
+        },
     }
 }
 
@@ -1187,18 +1356,15 @@ fn decode_list_map(raw: Option<&str>) -> Result<HashMap<String, Vec<String>>, As
 }
 
 fn normalize_json_array_string(raw: Option<&str>, field: &str) -> Result<String, AssistantError> {
-    serde_json::to_string(&decode_str_list(raw)?)
-        .map_err(|e| AssistantError::Internal(format!("encode {field}: {e}")))
+    serde_json::to_string(&decode_str_list(raw)?).map_err(|e| AssistantError::Internal(format!("encode {field}: {e}")))
 }
 
 fn normalize_json_object_string(raw: Option<&str>, field: &str) -> Result<String, AssistantError> {
-    serde_json::to_string(&decode_str_map(raw)?)
-        .map_err(|e| AssistantError::Internal(format!("encode {field}: {e}")))
+    serde_json::to_string(&decode_str_map(raw)?).map_err(|e| AssistantError::Internal(format!("encode {field}: {e}")))
 }
 
 fn normalize_json_map_of_arrays_string(raw: Option<&str>, field: &str) -> Result<String, AssistantError> {
-    serde_json::to_string(&decode_list_map(raw)?)
-        .map_err(|e| AssistantError::Internal(format!("encode {field}: {e}")))
+    serde_json::to_string(&decode_list_map(raw)?).map_err(|e| AssistantError::Internal(format!("encode {field}: {e}")))
 }
 
 // ---------------------------------------------------------------------------

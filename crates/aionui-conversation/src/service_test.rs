@@ -29,9 +29,13 @@ use aionui_db::models::{
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SortOrder,
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantPreferenceRepository,
+    IAssistantStateRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
+    SaveRuntimeStateParams, SortOrder, SqliteAssistantDefinitionRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantStateRepository, UpsertAssistantDefinitionParams, UpsertAssistantPreferenceParams,
+    UpsertAssistantStateParams, init_database_memory,
 };
+use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -53,6 +57,37 @@ struct SkillLinkCall {
 struct RecordingSkillResolver {
     names: Vec<String>,
     links: Arc<Mutex<Vec<SkillLinkCall>>>,
+}
+
+struct StaticAssistantDispatcher {
+    rules: std::collections::HashMap<String, String>,
+}
+
+#[async_trait::async_trait]
+impl AssistantRuleDispatcher for StaticAssistantDispatcher {
+    async fn read_rule(&self, id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+        Ok(self.rules.get(id).cloned().unwrap_or_default())
+    }
+
+    async fn write_rule(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+        Ok(())
+    }
+
+    async fn delete_rule(&self, _id: &str) -> Result<bool, ExtensionError> {
+        Ok(true)
+    }
+
+    async fn read_skill(&self, _id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+        Ok(String::new())
+    }
+
+    async fn write_skill(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+        Ok(())
+    }
+
+    async fn delete_skill(&self, _id: &str) -> Result<bool, ExtensionError> {
+        Ok(true)
+    }
 }
 
 impl RecordingSkillResolver {
@@ -621,6 +656,32 @@ fn make_service_with_mock_task_manager(
         Arc::new(StubAcpSessionRepo::default()),
     );
     (svc, broadcaster, repo)
+}
+
+async fn make_service_with_assistant_support(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    dispatcher: Arc<dyn AssistantRuleDispatcher>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<SqliteAssistantDefinitionRepository>,
+    Arc<SqliteAssistantStateRepository>,
+    Arc<dyn IAssistantPreferenceRepository>,
+) {
+    let (svc, broadcaster, repo, _task_mgr) = make_service_with_resolver(skill_resolver);
+    let db = init_database_memory().await.unwrap();
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    let state_repo = Arc::new(SqliteAssistantStateRepository::new(db.pool().clone()));
+    let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
+        Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
+
+    svc.with_assistant_definition_repo(definition_repo.clone());
+    svc.with_assistant_state_repo(state_repo.clone());
+    svc.with_assistant_preference_repo(preference_repo.clone());
+    svc.with_assistant_dispatcher(dispatcher);
+
+    (svc, broadcaster, repo, definition_repo, state_repo, preference_repo)
 }
 
 fn make_create_req() -> CreateConversationRequest {
@@ -3321,6 +3382,107 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
     assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
     assert!(resp.extra.get("preset_enabled_skills").is_none());
     assert!(resp.extra.get("exclude_auto_inject_skills").is_none());
+}
+
+#[tokio::test]
+async fn create_resolves_assistant_snapshot_and_updates_preferences() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into(), "todo-tracker".into()],
+    });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-1".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, state_repo, preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "preset-1",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("preset-1"),
+            source_version: None,
+            source_hash: None,
+            name: "Preset",
+            name_i18n: "{}",
+            description: Some("desc"),
+            description_i18n: "{}",
+            avatar: Some("🤖"),
+            agent_backend: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("rules/preset-1.md"),
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantStateParams {
+            assistant_id: "preset-1",
+            enabled: true,
+            sort_order: 0,
+            agent_backend_override: Some("codex"),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_id: "preset-1",
+            last_model_id: Some("old-model"),
+            last_permission_value: Some("workspace-write"),
+            last_skill_ids: r#"["legacy-skill"]"#,
+            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+            last_mcp_ids: r#"["legacy-mcp"]"#,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "assistant_id": "preset-1",
+            "assistant_locale": "zh-CN",
+            "assistant_overrides": {
+                "model": "new-model",
+                "skill_ids": ["pdf"],
+                "disabled_builtin_skill_ids": ["todo-tracker"],
+            }
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["assistant_id"], json!("preset-1"));
+    assert_eq!(resp.extra["preset_assistant_id"], json!("preset-1"));
+    assert_eq!(resp.extra["preset_context"], json!("assistant rule body"));
+    assert_eq!(resp.extra["current_model_id"], json!("new-model"));
+    assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
+    assert_eq!(resp.extra["assistant_snapshot"]["agent_backend"], json!("codex"));
+    assert_eq!(
+        resp.extra["assistant_snapshot"]["resolved_defaults"]["skill_ids"],
+        json!(["pdf"])
+    );
+
+    let updated_pref = preference_repo.get("preset-1").await.unwrap().unwrap();
+    assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
+    assert_eq!(updated_pref.last_skill_ids, r#"["pdf"]"#);
+    assert_eq!(updated_pref.last_disabled_builtin_skill_ids, r#"["todo-tracker"]"#);
 }
 
 #[tokio::test]

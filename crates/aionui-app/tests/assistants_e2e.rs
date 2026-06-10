@@ -16,10 +16,11 @@ use std::sync::Arc;
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
 use aionui_db::{
-    IAssistantDefinitionRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository,
-    IAssistantRepository, IAssistantStateRepository, IProviderRepository, SqliteAssistantDefinitionRepository,
+    IAssistantDefinitionRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IAssistantStateRepository, IProviderRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteAssistantStateRepository, SqliteProviderRepository, init_database_memory,
+    SqliteAssistantStateRepository, SqliteProviderRepository, UpsertAssistantDefinitionParams,
+    UpsertAssistantPreferenceParams, UpsertAssistantStateParams, init_database_memory,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionSource, ExtensionStateStore,
@@ -305,6 +306,125 @@ async fn list_requires_auth() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn get_detail_returns_definition_state_preferences_and_rules() {
+    let fx = fixture().await;
+
+    let create_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u1",
+            "name": "Mine",
+            "description": "hello",
+            "preset_agent_type": "aionrs",
+            "enabled_skills": ["legacy-default"],
+            "custom_skill_names": ["custom-note"],
+            "disabled_builtin_skills": ["todo-tracker"],
+            "prompts": ["draft a summary"]
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let create_resp = fx.app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let write_rule_req = json_with_token(
+        "POST",
+        "/api/skills/assistant-rule/write",
+        json!({ "assistant_id": "u1", "content": "user rule body", "locale": "en-US" }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let write_rule_resp = fx.app.clone().oneshot(write_rule_req).await.unwrap();
+    assert_eq!(write_rule_resp.status(), StatusCode::OK);
+
+    let pool = fx.services.database.pool().clone();
+    let definition_repo = SqliteAssistantDefinitionRepository::new(pool.clone());
+    let state_repo = SqliteAssistantStateRepository::new(pool.clone());
+    let preference_repo = SqliteAssistantPreferenceRepository::new(pool);
+    let definition = definition_repo.get("u1").await.unwrap().unwrap();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: &definition.id,
+            source: &definition.source,
+            owner_type: &definition.owner_type,
+            source_ref: definition.source_ref.as_deref(),
+            source_version: definition.source_version.as_deref(),
+            source_hash: definition.source_hash.as_deref(),
+            name: &definition.name,
+            name_i18n: &definition.name_i18n,
+            description: definition.description.as_deref(),
+            description_i18n: &definition.description_i18n,
+            avatar: definition.avatar.as_deref(),
+            agent_backend: &definition.agent_backend,
+            rule_resource_type: &definition.rule_resource_type,
+            rule_resource_ref: definition.rule_resource_ref.as_deref(),
+            rule_inline_content: definition.rule_inline_content.as_deref(),
+            recommended_prompts: r#"["draft a summary","share next steps"]"#,
+            recommended_prompts_i18n: r#"{"zh-CN":["总结一下"]}"#,
+            default_model_mode: "fixed",
+            default_model_value: Some("gpt-4.1"),
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "fixed",
+            default_skill_ids: r#"["preset-pdf"]"#,
+            custom_skill_names: &definition.custom_skill_names,
+            default_disabled_builtin_skill_ids: r#"["todo-tracker"]"#,
+            default_mcps_mode: "auto",
+            default_mcp_ids: r#"["mcp-legacy"]"#,
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantStateParams {
+            assistant_id: "u1",
+            enabled: false,
+            sort_order: 7,
+            agent_backend_override: Some("codex"),
+            last_used_at: Some(1_725_000_001_234),
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_id: "u1",
+            last_model_id: Some("gpt-5-mini"),
+            last_permission_value: Some("workspace-write"),
+            last_skill_ids: r#"["pref-skill"]"#,
+            last_disabled_builtin_skill_ids: r#"["planner"]"#,
+            last_mcp_ids: r#"["mcp-pref"]"#,
+        })
+        .await
+        .unwrap();
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/u1?locale=en-US", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(data["id"], "u1");
+    assert_eq!(data["source"], "user");
+    assert_eq!(data["profile"]["name"], "Mine");
+    assert_eq!(data["state"]["enabled"], false);
+    assert_eq!(data["state"]["sort_order"], 7);
+    assert_eq!(data["engine"]["agent_backend"], "codex");
+    assert_eq!(data["rules"]["content"], "user rule body");
+    assert_eq!(data["rules"]["storage_mode"], "user_file");
+    assert_eq!(data["defaults"]["model"]["mode"], "fixed");
+    assert_eq!(data["defaults"]["model"]["value"], "gpt-4.1");
+    assert_eq!(data["defaults"]["skills"]["value"], json!(["preset-pdf"]));
+    assert_eq!(data["capabilities"]["custom_skill_names"], json!(["custom-note"]));
+    assert_eq!(data["preferences"]["last_permission_value"], "workspace-write");
+    assert_eq!(data["preferences"]["last_skill_ids"], json!(["pref-skill"]));
 }
 
 // ===========================================================================

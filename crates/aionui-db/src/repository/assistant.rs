@@ -3,8 +3,8 @@
 use crate::error::DbError;
 use crate::models::{
     AssistantDefinitionRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, AssistantStateRow,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantPreferenceParams, UpsertAssistantStateParams, UpsertOverrideParams,
+    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantPreferenceParams,
+    UpsertAssistantStateParams, UpsertOverrideParams,
 };
 
 /// CRUD access for user-authored assistant rows.
@@ -61,10 +61,7 @@ pub trait IAssistantOverrideRepository: Send + Sync {
 pub trait IAssistantDefinitionRepository: Send + Sync {
     async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError>;
     async fn get(&self, id: &str) -> Result<Option<AssistantDefinitionRow>, DbError>;
-    async fn upsert(
-        &self,
-        params: &UpsertAssistantDefinitionParams<'_>,
-    ) -> Result<AssistantDefinitionRow, DbError>;
+    async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError>;
     async fn soft_delete(&self, id: &str, deleted_at: i64) -> Result<bool, DbError>;
 }
 
@@ -81,9 +78,6 @@ pub trait IAssistantStateRepository: Send + Sync {
 #[async_trait::async_trait]
 pub trait IAssistantPreferenceRepository: Send + Sync {
     async fn get(&self, assistant_id: &str) -> Result<Option<AssistantPreferenceRow>, DbError>;
-    async fn upsert(
-        &self,
-        params: &UpsertAssistantPreferenceParams<'_>,
-    ) -> Result<AssistantPreferenceRow, DbError>;
+    async fn upsert(&self, params: &UpsertAssistantPreferenceParams<'_>) -> Result<AssistantPreferenceRow, DbError>;
     async fn delete(&self, assistant_id: &str) -> Result<bool, DbError>;
 }

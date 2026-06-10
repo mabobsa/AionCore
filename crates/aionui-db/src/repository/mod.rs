@@ -30,8 +30,8 @@ mod user;
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
 pub use assistant::{
-    IAssistantDefinitionRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository,
-    IAssistantRepository, IAssistantStateRepository,
+    IAssistantDefinitionRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IAssistantStateRepository,
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;

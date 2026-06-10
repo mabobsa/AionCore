@@ -58,6 +58,106 @@ pub struct AssistantResponse {
     pub last_used_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantProfileResponse {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub name_i18n: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub description_i18n: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantStateResponse {
+    pub enabled: bool,
+    pub sort_order: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantEngineResponse {
+    pub agent_backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantRulesResponse {
+    pub content: String,
+    pub storage_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantPromptsResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub recommended_i18n: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultScalarResponse {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultListResponse {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDefaultsResponse {
+    pub model: AssistantDefaultScalarResponse,
+    pub permission: AssistantDefaultScalarResponse,
+    pub skills: AssistantDefaultListResponse,
+    pub mcps: AssistantDefaultListResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantCapabilitiesResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_skill_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_disabled_builtin_skill_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantPreferencesResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_permission_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_disabled_builtin_skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_mcp_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDetailResponse {
+    pub id: String,
+    pub source: AssistantSource,
+    pub profile: AssistantProfileResponse,
+    pub state: AssistantStateResponse,
+    pub engine: AssistantEngineResponse,
+    pub rules: AssistantRulesResponse,
+    pub prompts: AssistantPromptsResponse,
+    pub defaults: AssistantDefaultsResponse,
+    pub capabilities: AssistantCapabilitiesResponse,
+    pub preferences: AssistantPreferencesResponse,
+}
+
 // ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------

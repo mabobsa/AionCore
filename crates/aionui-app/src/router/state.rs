@@ -190,14 +190,9 @@ pub async fn build_module_states(
     );
 
     let assistant = build_assistant_state(services, ext_state.registry.clone());
-    assistant
-        .service
-        .bootstrap_assistant_storage()
-        .await
-        .map_err(|error| {
-            RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage")
-                .with_source(error)
-        })?;
+    assistant.service.bootstrap_assistant_storage().await.map_err(|error| {
+        RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
+    })?;
     let cron = build_cron_state(services);
     cron.cron_service.init().await;
     tracing::info!(
@@ -245,7 +240,11 @@ pub async fn build_module_states(
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
-            build_conversation_state(services, Some(cron.cron_service.clone()))
+            build_conversation_state(
+                services,
+                Some(cron.cron_service.clone()),
+                Some(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>),
+            )
         }),
         remote_agent: build_module_state_phase(&boot, "remote_agent", || build_remote_agent_state(services)),
         agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
@@ -343,12 +342,13 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 pub fn build_conversation_state(
     services: &AppServices,
     cron_service: Option<Arc<aionui_cron::service::CronService>>,
+    assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
 ) -> ConversationRouterState {
     let pool = services.database.pool().clone();
     let conversaion_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
         services.skill_paths.clone(),
     ));
@@ -365,6 +365,14 @@ pub fn build_conversation_state(
     conversation_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
+    conversation_service
+        .with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone())));
+    conversation_service.with_assistant_state_repo(Arc::new(SqliteAssistantStateRepository::new(pool.clone())));
+    conversation_service
+        .with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone())));
+    if let Some(dispatcher) = assistant_dispatcher {
+        conversation_service.with_assistant_dispatcher(dispatcher);
+    }
     if let Some(hook) = services.task_manager_delete_hook.clone() {
         conversation_service.with_delete_hook(hook);
     }
