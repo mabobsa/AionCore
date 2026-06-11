@@ -10,13 +10,13 @@ use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
-    ApprovalCheckResponse, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
+    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
+    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete, PaginatedResult,
@@ -63,6 +63,18 @@ struct AssistantConversationOverrides {
     disabled_builtin_skill_ids: Option<Vec<String>>,
     #[serde(default)]
     mcp_ids: Option<Vec<String>>,
+}
+
+impl From<AssistantConversationOverridesRequest> for AssistantConversationOverrides {
+    fn from(value: AssistantConversationOverridesRequest) -> Self {
+        Self {
+            model: value.model,
+            permission: value.permission,
+            skill_ids: value.skill_ids,
+            disabled_builtin_skill_ids: value.disabled_builtin_skill_ids,
+            mcp_ids: value.mcp_ids,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -545,27 +557,23 @@ impl ConversationService {
             obj.remove("custom_workspace");
         }
 
-        let (assistant_id, assistant_locale, assistant_overrides) = match extra.as_object_mut() {
-            Some(obj) => {
-                let assistant_id = obj
-                    .remove("assistant_id")
-                    .or_else(|| obj.get("preset_assistant_id").cloned())
-                    .and_then(|value| value.as_str().map(ToOwned::to_owned));
-                let assistant_locale = obj
-                    .remove("assistant_locale")
-                    .and_then(|value| value.as_str().map(ToOwned::to_owned));
-                let overrides = obj
-                    .remove("assistant_overrides")
-                    .map(serde_json::from_value::<AssistantConversationOverrides>)
-                    .transpose()
-                    .map_err(|e| ConversationError::BadRequest {
-                        reason: format!("Invalid assistant_overrides: {e}"),
-                    })?
-                    .unwrap_or_default();
-                (assistant_id, assistant_locale, overrides)
-            }
-            None => (None, None, AssistantConversationOverrides::default()),
-        };
+        let assistant_id = req
+            .assistant
+            .as_ref()
+            .map(|assistant| assistant.id.clone())
+            .or_else(|| {
+                extra
+                    .as_object()
+                    .and_then(|obj| obj.get("preset_assistant_id"))
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            });
+        let assistant_locale = req.assistant.as_ref().and_then(|assistant| assistant.locale.clone());
+        let assistant_overrides = req
+            .assistant
+            .clone()
+            .and_then(|assistant| assistant.conversation_overrides)
+            .map(AssistantConversationOverrides::from)
+            .unwrap_or_default();
         let assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
                 self.resolve_assistant_snapshot(id, assistant_locale.as_deref(), &assistant_overrides, &extra)

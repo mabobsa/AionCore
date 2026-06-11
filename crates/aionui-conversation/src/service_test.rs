@@ -827,11 +827,13 @@ async fn create_assistant_backed_conversation(
     let mut payload = json!({
         "type": conversation_type,
         "name": "assistant conversation",
+        "assistant": {
+            "id": assistant_id,
+            "locale": "en-US"
+        },
         "extra": {
             "workspace": workspace,
-            "backend": backend,
-            "assistant_id": assistant_id,
-            "assistant_locale": "en-US"
+            "backend": backend
         }
     });
 
@@ -3969,16 +3971,18 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "t",
-        "extra": {
-            "workspace": workspace,
-            "backend": "claude",
-            "assistant_id": "preset-1",
-            "assistant_locale": "zh-CN",
-            "assistant_overrides": {
+        "assistant": {
+            "id": "preset-1",
+            "locale": "zh-CN",
+            "conversation_overrides": {
                 "model": "new-model",
                 "skill_ids": ["pdf"],
                 "disabled_builtin_skill_ids": ["todo-tracker"],
             }
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
         },
     }))
     .unwrap();
@@ -4078,18 +4082,20 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "t",
-        "extra": {
-            "workspace": workspace,
-            "backend": "claude",
-            "assistant_id": "preset-fixed",
-            "assistant_locale": "zh-CN",
-            "assistant_overrides": {
+        "assistant": {
+            "id": "preset-fixed",
+            "locale": "zh-CN",
+            "conversation_overrides": {
                 "model": "new-model",
                 "permission": "workspace-read",
                 "skill_ids": ["pdf", "cron"],
                 "disabled_builtin_skill_ids": [],
                 "mcp_ids": ["mcp-temp"]
             }
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
         },
     }))
     .unwrap();
@@ -4174,11 +4180,13 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "t",
+        "assistant": {
+            "id": "preset-auto",
+            "locale": "zh-CN"
+        },
         "extra": {
             "workspace": workspace,
-            "backend": "claude",
-            "assistant_id": "preset-auto",
-            "assistant_locale": "zh-CN"
+            "backend": "claude"
         },
     }))
     .unwrap();

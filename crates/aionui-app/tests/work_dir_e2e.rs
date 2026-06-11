@@ -23,6 +23,7 @@ async fn conversation_workspace_uses_work_dir() {
         r#type: AgentType::Acp,
         name: Some("test".to_string()),
         model: None,
+        assistant: None,
         source: None,
         channel_chat_id: None,
         extra: serde_json::json!({}),
@@ -60,6 +61,7 @@ async fn user_specified_workspace_is_not_overridden() {
         r#type: AgentType::Acp,
         name: Some("test".to_string()),
         model: None,
+        assistant: None,
         source: None,
         channel_chat_id: None,
         extra: serde_json::json!({
@@ -93,6 +95,7 @@ async fn workspace_defaults_to_data_dir_when_work_dir_equals_data_dir() {
         r#type: AgentType::Acp,
         name: Some("test".to_string()),
         model: None,
+        assistant: None,
         source: None,
         channel_chat_id: None,
         extra: serde_json::json!({}),

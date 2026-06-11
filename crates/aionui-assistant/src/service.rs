@@ -18,7 +18,7 @@ use aionui_db::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
     IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, rebuild_legacy_assistant_mirror,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, rebuild_legacy_assistant_mirror,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
@@ -553,6 +553,10 @@ impl AssistantService {
         let row = self.repo.create(&params).await?;
         self.upsert_definition_from_legacy_user_row(&row).await?;
         self.apply_detail_overrides(&row.id, detail_overrides, false).await?;
+        if let Some(definition) = self.definition_repo.get_by_key(&row.id).await? {
+            self.sync_preferences_from_defaults_request(&definition, None, req.defaults.as_ref())
+                .await?;
+        }
         self.get(&id).await
     }
 
@@ -630,6 +634,8 @@ impl AssistantService {
                     .get_by_key(id)
                     .await?
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
+                self.sync_preferences_from_defaults_request(&definition, Some(&definition), req.defaults.as_ref())
+                    .await?;
                 let state = self.state_repo.get(&definition.definition_id).await?;
                 rebuild_legacy_assistant_mirror(&self.pool, &definition, state.as_ref())
                     .await
@@ -678,7 +684,171 @@ impl AssistantService {
         self.upsert_definition_from_legacy_user_row(&row).await?;
         self.apply_detail_overrides(id, detail_overrides, reset_model_and_permission)
             .await?;
+        if let Some(definition) = self.definition_repo.get_by_key(id).await? {
+            self.sync_preferences_from_defaults_request(&definition, Some(&current_definition), req.defaults.as_ref())
+                .await?;
+        }
         self.get(id).await
+    }
+
+    async fn sync_preferences_from_defaults_request(
+        &self,
+        definition: &AssistantDefinitionRow,
+        previous_definition: Option<&AssistantDefinitionRow>,
+        defaults: Option<&AssistantDefaultsRequest>,
+    ) -> Result<(), AssistantError> {
+        let Some(defaults) = defaults else {
+            return Ok(());
+        };
+
+        let existing = self
+            .preference_repo
+            .get(&definition.definition_id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("get assistant preference: {e}")))?;
+
+        let mut last_model_id = existing.as_ref().and_then(|row| row.last_model_id.clone());
+        let mut last_permission_value = existing
+            .as_ref()
+            .and_then(|row| row.last_permission_value.clone());
+        let mut last_skill_ids = existing
+            .as_ref()
+            .map(|row| decode_str_list(Some(row.last_skill_ids.as_str())))
+            .transpose()?
+            .unwrap_or_default();
+        let mut last_disabled_builtin_skill_ids = existing
+            .as_ref()
+            .map(|row| decode_str_list(Some(row.last_disabled_builtin_skill_ids.as_str())))
+            .transpose()?
+            .unwrap_or_default();
+        let mut last_mcp_ids = existing
+            .as_ref()
+            .map(|row| decode_str_list(Some(row.last_mcp_ids.as_str())))
+            .transpose()?
+            .unwrap_or_default();
+
+        if let Some(model) = defaults.model.as_ref() {
+            match model.mode.as_str() {
+                "fixed" => {
+                    last_model_id = model.value.clone().filter(|value| !value.trim().is_empty());
+                }
+                "auto" => {
+                    if previous_definition
+                        .is_some_and(|current| current.default_model_mode == "fixed")
+                    {
+                        last_model_id = None;
+                    }
+                }
+                other => {
+                    return Err(AssistantError::BadRequest(format!(
+                        "defaults.model.mode must be 'auto' or 'fixed', got '{other}'"
+                    )));
+                }
+            }
+        }
+
+        if let Some(permission) = defaults.permission.as_ref() {
+            match permission.mode.as_str() {
+                "fixed" => {
+                    last_permission_value = permission
+                        .value
+                        .clone()
+                        .filter(|value| !value.trim().is_empty());
+                }
+                "auto" => {
+                    if previous_definition
+                        .is_some_and(|current| current.default_permission_mode == "fixed")
+                    {
+                        last_permission_value = None;
+                    }
+                }
+                other => {
+                    return Err(AssistantError::BadRequest(format!(
+                        "defaults.permission.mode must be 'auto' or 'fixed', got '{other}'"
+                    )));
+                }
+            }
+        }
+
+        if let Some(skills) = defaults.skills.as_ref() {
+            match skills.mode.as_str() {
+                "fixed" => {
+                    last_skill_ids = skills.value.clone();
+                    last_disabled_builtin_skill_ids.clear();
+                }
+                "auto" => {
+                    if previous_definition
+                        .is_some_and(|current| current.default_skills_mode == "fixed")
+                    {
+                        last_skill_ids.clear();
+                        last_disabled_builtin_skill_ids.clear();
+                    }
+                }
+                other => {
+                    return Err(AssistantError::BadRequest(format!(
+                        "defaults.skills.mode must be 'auto' or 'fixed', got '{other}'"
+                    )));
+                }
+            }
+        }
+
+        if let Some(mcps) = defaults.mcps.as_ref() {
+            match mcps.mode.as_str() {
+                "fixed" => {
+                    last_mcp_ids = mcps.value.clone();
+                }
+                "auto" => {
+                    if previous_definition
+                        .is_some_and(|current| current.default_mcps_mode == "fixed")
+                    {
+                        last_mcp_ids.clear();
+                    }
+                }
+                other => {
+                    return Err(AssistantError::BadRequest(format!(
+                        "defaults.mcps.mode must be 'auto' or 'fixed', got '{other}'"
+                    )));
+                }
+            }
+        }
+
+        if last_model_id.is_none()
+            && last_permission_value.is_none()
+            && last_skill_ids.is_empty()
+            && last_disabled_builtin_skill_ids.is_empty()
+            && last_mcp_ids.is_empty()
+        {
+            if existing.is_some() {
+                self.preference_repo
+                    .delete(&definition.definition_id)
+                    .await
+                    .map_err(|e| AssistantError::Internal(format!("delete assistant preference: {e}")))?;
+            }
+            return Ok(());
+        }
+
+        let last_skill_ids_json = serde_json::to_string(&last_skill_ids)
+            .map_err(|e| AssistantError::Internal(format!("encode assistant skills preference: {e}")))?;
+        let last_disabled_builtin_skill_ids_json =
+            serde_json::to_string(&last_disabled_builtin_skill_ids).map_err(|e| {
+                AssistantError::Internal(format!("encode disabled assistant skills preference: {e}"))
+            })?;
+        let last_mcp_ids_json = serde_json::to_string(&last_mcp_ids)
+            .map_err(|e| AssistantError::Internal(format!("encode assistant mcp preference: {e}")))?;
+
+        self.preference_repo
+            .upsert(&UpsertAssistantPreferenceParams {
+                definition_id: &definition.definition_id,
+                last_model_id: last_model_id.as_deref(),
+                last_permission_value: last_permission_value.as_deref(),
+                last_skill_ids: &last_skill_ids_json,
+                last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids_json,
+                last_mcp_ids: &last_mcp_ids_json,
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(format!("upsert assistant preference: {e}")))?;
+
+        Ok(())
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), AssistantError> {
@@ -1741,6 +1911,7 @@ mod tests {
         service: AssistantService,
         definition_repo: Arc<dyn IAssistantDefinitionRepository>,
         state_repo: Arc<dyn IAssistantOverlayRepository>,
+        preference_repo: Arc<dyn IAssistantPreferenceRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         _tmp: TempDir,
         _db: aionui_db::Database,
@@ -1821,7 +1992,7 @@ mod tests {
             db.pool().clone(),
             definition_repo.clone(),
             state_repo.clone(),
-            preference_repo,
+            preference_repo.clone(),
             repo,
             orepo,
             provider_repo.clone(),
@@ -1834,6 +2005,7 @@ mod tests {
             service,
             definition_repo,
             state_repo,
+            preference_repo,
             provider_repo,
             _tmp: tmp,
             _db: db,
@@ -2352,6 +2524,126 @@ mod tests {
         assert_eq!(detail.defaults.skills.value, vec!["skill-z"]);
         assert_eq!(detail.defaults.mcps.mode, "auto");
         assert!(detail.defaults.mcps.value.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_switching_defaults_to_fixed_seeds_preferences() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("openai/gpt-5".into()),
+                        }),
+                        permission: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("strict".into()),
+                        }),
+                        skills: Some(AssistantDefaultListRequest {
+                            mode: "fixed".into(),
+                            value: vec!["skill-z".into()],
+                        }),
+                        mcps: Some(AssistantDefaultListRequest {
+                            mode: "fixed".into(),
+                            value: vec!["mcp-z".into()],
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let definition = fx.definition_repo.get_by_key("u1").await.unwrap().unwrap();
+        let pref = fx
+            .preference_repo
+            .get(&definition.definition_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.last_model_id.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(pref.last_permission_value.as_deref(), Some("strict"));
+        assert_eq!(pref.last_skill_ids, r#"["skill-z"]"#);
+        assert_eq!(pref.last_mcp_ids, r#"["mcp-z"]"#);
+    }
+
+    #[tokio::test]
+    async fn update_switching_defaults_from_fixed_to_auto_clears_preferences() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                defaults: Some(AssistantDefaultsRequest {
+                    model: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("openai/gpt-5".into()),
+                    }),
+                    permission: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("strict".into()),
+                    }),
+                    skills: Some(AssistantDefaultListRequest {
+                        mode: "fixed".into(),
+                        value: vec!["skill-z".into()],
+                    }),
+                    mcps: Some(AssistantDefaultListRequest {
+                        mode: "fixed".into(),
+                        value: vec!["mcp-z".into()],
+                    }),
+                }),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "auto".into(),
+                            value: None,
+                        }),
+                        permission: Some(AssistantDefaultScalarRequest {
+                            mode: "auto".into(),
+                            value: None,
+                        }),
+                        skills: Some(AssistantDefaultListRequest {
+                            mode: "auto".into(),
+                            value: vec![],
+                        }),
+                        mcps: Some(AssistantDefaultListRequest {
+                            mode: "auto".into(),
+                            value: vec![],
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let definition = fx.definition_repo.get_by_key("u1").await.unwrap().unwrap();
+        assert!(fx
+            .preference_repo
+            .get(&definition.definition_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

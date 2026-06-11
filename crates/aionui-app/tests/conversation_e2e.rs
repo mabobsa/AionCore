@@ -211,15 +211,18 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         json!({
             "type": "acp",
             "name": "Snapshot Flow",
-            "extra": {
-                "assistant_id": "u1",
-                "assistant_locale": "en-US",
-                "assistant_overrides": {
+            "assistant": {
+                "id": "u1",
+                "locale": "en-US",
+                "conversation_overrides": {
                     "model": "override-model",
                     "skill_ids": ["override-skill"],
                     "disabled_builtin_skill_ids": ["override-disabled"],
                     "mcp_ids": ["override-mcp"]
                 }
+            },
+            "extra": {
+                "preset_assistant_id": "u1"
             }
         }),
         &token,
