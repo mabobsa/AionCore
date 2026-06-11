@@ -4,10 +4,9 @@
 //! Each test exercises the router end-to-end via `tower::ServiceExt::oneshot`
 //! against a real `aionui_app::create_router_with_states` instance backed by
 //! an in-memory SQLite database. The assistant module state is re-built with
-//! a temp-dir built-in manifest, a temp user-data dir, and (where needed) an
-//! extension registry initialized from a fixture manifest that contributes an
-//! assistant — giving coverage of the three-source dispatch (builtin / user /
-//! extension) without touching `~/.aionui/`.
+//! a temp-dir built-in manifest, a temp user-data dir, and a temp extension
+//! registry for the unrelated extension router state without touching
+//! `~/.aionui/`.
 
 mod common;
 
@@ -60,9 +59,6 @@ struct Fixture {
 ///   `builtin-bare` with nothing referenced)
 /// - a temp user-data dir that `AssistantService` uses for user rule/skill/
 ///   avatar storage
-/// - an extension registry initialized from a fixture manifest that
-///   contributes an assistant with id `ext-helper`
-///
 /// Also logs in `admin` and hands back the session + CSRF tokens so tests
 /// can issue authenticated mutating requests.
 async fn fixture() -> Fixture {
@@ -235,7 +231,6 @@ async fn fixture() -> Fixture {
         override_repo,
         provider_repo,
         builtin,
-        registry,
         user_data_dir.clone(),
     ));
     service.bootstrap_assistant_storage().await.unwrap();
@@ -268,7 +263,7 @@ async fn fixture() -> Fixture {
 // ===========================================================================
 
 #[tokio::test]
-async fn list_populated_returns_builtins_and_extension() {
+async fn list_populated_excludes_extension_assistants() {
     let fx = fixture().await;
 
     let resp = fx
@@ -281,15 +276,16 @@ async fn list_populated_returns_builtins_and_extension() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let list = json["data"].as_array().unwrap();
-    // 2 builtins + 1 extension
-    assert_eq!(list.len(), 3, "body = {json}");
+    // Extension-contributed assistants are no longer part of the unified
+    // assistant catalog.
+    assert_eq!(list.len(), 2, "body = {json}");
     let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"builtin-office"));
     assert!(ids.contains(&"builtin-bare"));
-    assert!(ids.contains(&"ext-helper"));
+    assert!(!ids.contains(&"ext-helper"));
     let sources: Vec<&str> = list.iter().map(|a| a["source"].as_str().unwrap()).collect();
     assert!(sources.contains(&"builtin"));
-    assert!(sources.contains(&"extension"));
+    assert!(!sources.contains(&"extension"));
 }
 
 #[tokio::test]
@@ -473,7 +469,7 @@ async fn create_rejects_builtin_id_collision_with_400() {
 }
 
 #[tokio::test]
-async fn create_rejects_extension_id_collision_with_400() {
+async fn create_allows_id_that_matches_extension_registry_assistant() {
     let fx = fixture().await;
     let req = json_with_token(
         "POST",
@@ -483,7 +479,106 @@ async fn create_rejects_extension_id_collision_with_400() {
         &fx.csrf,
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route() {
+    let fx = fixture().await;
+    let source_avatar = fx.user_data_dir.join("picked-avatar.png");
+    std::fs::write(&source_avatar, b"picked-avatar-bytes").unwrap();
+
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u-avatar",
+            "name": "Avatar User",
+            "avatar": source_avatar.to_string_lossy(),
+            "preset_agent_type": "aionrs",
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let resp = fx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["avatar"], "/api/assistants/u-avatar/avatar");
+
+    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar.png");
+    assert!(
+        persisted_avatar.exists(),
+        "persisted avatar missing: {}",
+        persisted_avatar.display()
+    );
+    assert_eq!(std::fs::read(&persisted_avatar).unwrap(), b"picked-avatar-bytes");
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/u-avatar/avatar", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    let bytes = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&bytes[..], b"picked-avatar-bytes");
+}
+
+#[tokio::test]
+async fn update_user_avatar_with_existing_route_preserves_served_file() {
+    let fx = fixture().await;
+    let source_avatar = fx.user_data_dir.join("picked-avatar.png");
+    std::fs::write(&source_avatar, b"picked-avatar-bytes").unwrap();
+
+    let create_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u-avatar-stable",
+            "name": "Avatar User",
+            "avatar": source_avatar.to_string_lossy(),
+            "preset_agent_type": "aionrs",
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let create_resp = fx.app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let update_req = json_with_token(
+        "PUT",
+        "/api/assistants/u-avatar-stable",
+        json!({
+            "avatar": "/api/assistants/u-avatar-stable/avatar"
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let update_resp = fx.app.clone().oneshot(update_req).await.unwrap();
+    assert_eq!(update_resp.status(), StatusCode::OK);
+
+    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-stable.png");
+    assert!(
+        persisted_avatar.exists(),
+        "persisted avatar missing: {}",
+        persisted_avatar.display()
+    );
+    assert_eq!(std::fs::read(&persisted_avatar).unwrap(), b"picked-avatar-bytes");
+
+    let avatar_resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/u-avatar-stable/avatar", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(avatar_resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -561,7 +656,7 @@ async fn update_builtin_is_forbidden() {
 }
 
 #[tokio::test]
-async fn update_extension_is_forbidden() {
+async fn update_extension_registry_id_without_user_row_returns_404() {
     let fx = fixture().await;
     let req = json_with_token(
         "PUT",
@@ -571,7 +666,7 @@ async fn update_extension_is_forbidden() {
         &fx.csrf,
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ===========================================================================
@@ -637,7 +732,7 @@ async fn delete_builtin_is_forbidden() {
 }
 
 #[tokio::test]
-async fn delete_extension_is_forbidden() {
+async fn delete_extension_registry_id_without_user_row_returns_404() {
     let fx = fixture().await;
     let resp = fx
         .app
@@ -645,7 +740,7 @@ async fn delete_extension_is_forbidden() {
         .oneshot(delete_with_token("/api/assistants/ext-helper", &fx.token, &fx.csrf))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ===========================================================================
@@ -700,7 +795,7 @@ async fn set_state_updates_existing_override_for_user() {
 }
 
 #[tokio::test]
-async fn set_state_extension_is_400() {
+async fn set_state_extension_registry_id_without_user_row_returns_404() {
     let fx = fixture().await;
     let req = json_with_token(
         "PATCH",
@@ -710,7 +805,7 @@ async fn set_state_extension_is_400() {
         &fx.csrf,
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -766,7 +861,7 @@ async fn import_skips_builtin_collision() {
 }
 
 #[tokio::test]
-async fn import_skips_extension_collision() {
+async fn import_allows_id_that_matches_extension_registry_assistant() {
     let fx = fixture().await;
     let body = json!({
         "assistants": [
@@ -777,8 +872,8 @@ async fn import_skips_extension_collision() {
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["imported"], 0);
-    assert_eq!(json["data"]["skipped"], 1);
+    assert_eq!(json["data"]["imported"], 1);
+    assert_eq!(json["data"]["skipped"], 0);
 }
 
 #[tokio::test]
@@ -990,7 +1085,7 @@ async fn write_rule_builtin_returns_400() {
 }
 
 #[tokio::test]
-async fn write_rule_extension_returns_400() {
+async fn write_rule_extension_registry_id_behaves_like_user_id() {
     let fx = fixture().await;
     let req = json_with_token(
         "POST",
@@ -1000,7 +1095,7 @@ async fn write_rule_extension_returns_400() {
         &fx.csrf,
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ===========================================================================
@@ -1042,7 +1137,7 @@ async fn delete_rule_builtin_returns_400() {
 }
 
 #[tokio::test]
-async fn delete_rule_extension_returns_400() {
+async fn delete_rule_extension_registry_id_behaves_like_user_id() {
     let fx = fixture().await;
     let resp = fx
         .app
@@ -1054,7 +1149,7 @@ async fn delete_rule_extension_returns_400() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ===========================================================================
@@ -1156,7 +1251,7 @@ async fn write_skill_builtin_returns_400() {
 }
 
 #[tokio::test]
-async fn write_skill_extension_returns_400() {
+async fn write_skill_extension_registry_id_behaves_like_user_id() {
     let fx = fixture().await;
     let req = json_with_token(
         "POST",
@@ -1166,7 +1261,7 @@ async fn write_skill_extension_returns_400() {
         &fx.csrf,
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ===========================================================================
@@ -1208,7 +1303,7 @@ async fn delete_skill_builtin_returns_400() {
 }
 
 #[tokio::test]
-async fn delete_skill_extension_returns_400() {
+async fn delete_skill_extension_registry_id_behaves_like_user_id() {
     let fx = fixture().await;
     let resp = fx
         .app
@@ -1220,7 +1315,7 @@ async fn delete_skill_extension_returns_400() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ===========================================================================

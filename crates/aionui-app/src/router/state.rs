@@ -189,7 +189,7 @@ pub async fn build_module_states(
         "startup: extension registry initialized"
     );
 
-    let assistant = build_assistant_state(services, ext_state.registry.clone());
+    let assistant = build_assistant_state(services);
     assistant.service.bootstrap_assistant_storage().await.map_err(|error| {
         RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
     })?;
@@ -285,7 +285,7 @@ pub async fn build_module_states(
 }
 
 /// Build the default `AssistantRouterState` from application services.
-pub fn build_assistant_state(services: &AppServices, extension_registry: ExtensionRegistry) -> AssistantRouterState {
+pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     let pool = services.database.pool().clone();
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> =
         Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
@@ -315,7 +315,6 @@ pub fn build_assistant_state(services: &AppServices, extension_registry: Extensi
         override_repo,
         provider_repo,
         builtin,
-        extension_registry,
         services.data_dir.clone(),
     ));
     AssistantRouterState { service }

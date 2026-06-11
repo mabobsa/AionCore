@@ -12,9 +12,9 @@ CREATE TABLE IF NOT EXISTS assistant_definitions (
     definition_id                      TEXT PRIMARY KEY,
     assistant_key                      TEXT    NOT NULL,
     source                             TEXT    NOT NULL
-                                               CHECK (source IN ('builtin', 'user', 'generated', 'extension')),
+                                               CHECK (source IN ('builtin', 'user', 'generated')),
     owner_type                         TEXT    NOT NULL
-                                               CHECK (owner_type IN ('system', 'user', 'extension')),
+                                               CHECK (owner_type IN ('system', 'user')),
     source_ref                         TEXT,
     source_version                     TEXT,
     source_hash                        TEXT,

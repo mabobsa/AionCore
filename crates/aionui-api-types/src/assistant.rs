@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 pub enum AssistantSource {
     Builtin,
     User,
-    Extension,
 }
 
 /// Wire shape returned by `GET /api/assistants` (single element) and
@@ -304,8 +303,6 @@ mod tests {
         assert_eq!(json, "\"builtin\"");
         let json = serde_json::to_string(&AssistantSource::User).unwrap();
         assert_eq!(json, "\"user\"");
-        let json = serde_json::to_string(&AssistantSource::Extension).unwrap();
-        assert_eq!(json, "\"extension\"");
     }
 
     #[test]

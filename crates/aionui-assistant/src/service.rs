@@ -1,5 +1,5 @@
-//! Assistant service — three-source merge, CRUD, state overrides, import,
-//! and source-dispatched rule/skill read/write helpers.
+//! Assistant service — unified built-in + user assistant CRUD, state
+//! overlays, import, and source-dispatched rule/skill read/write helpers.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,9 +20,7 @@ use aionui_db::{
     IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
     UpsertAssistantOverlayParams, rebuild_legacy_assistant_mirror,
 };
-use aionui_extension::{
-    AssistantClassifier, AssistantRuleDispatcher, ExtensionError, ExtensionRegistry, ResolvedAssistant,
-};
+use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
 use tracing::{debug, warn};
 
@@ -45,7 +43,6 @@ pub struct AssistantService {
     /// pick an agent that actually matches the configured provider list.
     provider_repo: Arc<dyn IProviderRepository>,
     builtin: Arc<BuiltinAssistantRegistry>,
-    extension_registry: ExtensionRegistry,
     /// Root directory holding user-authored rule/skill md files and avatars.
     /// Defaults to `~/.aionui/` but can be overridden for tests.
     user_data_dir: PathBuf,
@@ -76,7 +73,6 @@ impl AssistantService {
         override_repo: Arc<dyn IAssistantOverrideRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         builtin: Arc<BuiltinAssistantRegistry>,
-        extension_registry: ExtensionRegistry,
         user_data_dir: PathBuf,
     ) -> Self {
         Self {
@@ -88,7 +84,6 @@ impl AssistantService {
             override_repo,
             provider_repo,
             builtin,
-            extension_registry,
             user_data_dir,
         }
     }
@@ -396,9 +391,6 @@ impl AssistantService {
         if self.builtin.has(id) {
             return AssistantSource::Builtin;
         }
-        if self.extension_registry.has_assistant(id).await {
-            return AssistantSource::Extension;
-        }
         AssistantSource::User
     }
 
@@ -406,9 +398,9 @@ impl AssistantService {
     // List / Get
     // -----------------------------------------------------------------------
 
-    /// Three-source merge (built-in + user + extension) with per-assistant
-    /// override application. Also performs opportunistic orphan cleanup on
-    /// the overrides table.
+    /// Unified assistant list (built-in + user) with per-assistant overlay
+    /// application. Also performs opportunistic orphan cleanup on the
+    /// overrides table.
     pub async fn list(&self) -> Result<Vec<AssistantResponse>, AssistantError> {
         let definitions = self
             .definition_repo
@@ -420,7 +412,6 @@ impl AssistantService {
             .list()
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant overlays: {e}")))?;
-        let extensions = self.extension_registry.get_assistants().await;
         let state_map: HashMap<String, AssistantOverlayRow> = states
             .into_iter()
             .map(|state| (state.definition_id.clone(), state))
@@ -433,9 +424,6 @@ impl AssistantService {
                 definition,
                 state_map.get(&definition.definition_id),
             )?);
-        }
-        for e in &extensions {
-            result.push(extension_to_response(e));
         }
 
         // Sort by sort_order asc, then last_used_at desc (newer first).
@@ -461,10 +449,6 @@ impl AssistantService {
             return definition_to_response(&definition, state.as_ref());
         }
 
-        if let Some(assistant) = self.extension_registry.get_assistant_by_id(id).await {
-            return Ok(extension_to_response(&assistant));
-        }
-
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
     }
 
@@ -474,10 +458,6 @@ impl AssistantService {
             let preference = self.preference_repo.get(&definition.definition_id).await?;
             let rules_content = self.read_rule(id, locale).await?;
             return definition_to_detail_response(&definition, state.as_ref(), preference.as_ref(), &rules_content);
-        }
-
-        if let Some(assistant) = self.extension_registry.get_assistant_by_id(id).await {
-            return Ok(extension_to_detail_response(&assistant));
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
@@ -536,15 +516,10 @@ impl AssistantService {
             _ => generate_user_id(),
         };
 
-        // Reject id collisions with built-in / extension-contributed.
+        // Reject id collisions with built-ins.
         if self.builtin.has(&id) {
             return Err(AssistantError::BadRequest(
                 "Id conflicts with built-in assistant".into(),
-            ));
-        }
-        if self.extension_registry.has_assistant(&id).await {
-            return Err(AssistantError::BadRequest(
-                "Id conflicts with extension-contributed assistant".into(),
             ));
         }
 
@@ -558,11 +533,12 @@ impl AssistantService {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => self.resolve_default_agent_type().await?,
         };
+        let avatar = self.normalize_user_avatar_input(&id, req.avatar.as_deref())?;
         let params = CreateAssistantParams {
             id: &id,
             name: &name,
             description: req.description.as_deref(),
-            avatar: req.avatar.as_deref(),
+            avatar: avatar.as_deref(),
             preset_agent_type: &resolved_agent_type,
             enabled_skills: serialized.enabled_skills.as_deref(),
             custom_skill_names: serialized.custom_skill_names.as_deref(),
@@ -660,11 +636,6 @@ impl AssistantService {
                     .map_err(|e| AssistantError::Internal(format!("rebuild legacy mirror: {e}")))?;
                 return self.get(id).await;
             }
-            AssistantSource::Extension => {
-                return Err(AssistantError::Forbidden(
-                    "Cannot modify extension-contributed assistant".into(),
-                ));
-            }
             AssistantSource::User => {}
         }
 
@@ -679,10 +650,15 @@ impl AssistantService {
             .preset_agent_type
             .as_deref()
             .is_some_and(|preset_agent_type| preset_agent_type != current_definition.agent_backend);
+        let normalized_avatar = if req.avatar.is_some() {
+            Some(self.normalize_user_avatar_input(id, req.avatar.as_deref())?)
+        } else {
+            None
+        };
         let params = UpdateAssistantParams {
             name: req.name.as_deref(),
             description: req.description.as_ref().map(|s| Some(s.as_str())),
-            avatar: req.avatar.as_ref().map(|s| Some(s.as_str())),
+            avatar: normalized_avatar.as_ref().map(|value| value.as_deref()),
             preset_agent_type: req.preset_agent_type.as_deref(),
             enabled_skills: serialized.enabled_skills.as_ref().map(|s| Some(s.as_str())),
             custom_skill_names: serialized.custom_skill_names.as_ref().map(|s| Some(s.as_str())),
@@ -709,11 +685,6 @@ impl AssistantService {
         match self.classify_source(id).await {
             AssistantSource::Builtin => {
                 return Err(AssistantError::Forbidden("Cannot delete built-in assistant".into()));
-            }
-            AssistantSource::Extension => {
-                return Err(AssistantError::Forbidden(
-                    "Cannot delete extension-contributed assistant".into(),
-                ));
             }
             AssistantSource::User => {}
         }
@@ -755,9 +726,6 @@ impl AssistantService {
         req: SetAssistantStateRequest,
     ) -> Result<AssistantResponse, AssistantError> {
         match self.classify_source(id).await {
-            AssistantSource::Extension => {
-                return Err(AssistantError::BadRequest("Extension assistants are read-only".into()));
-            }
             AssistantSource::Builtin => {}
             AssistantSource::User => {
                 // Confirm the user row exists (otherwise 404).
@@ -817,7 +785,7 @@ impl AssistantService {
     // -----------------------------------------------------------------------
 
     /// Bulk insert-only import of legacy Electron config rows. Skip on
-    /// built-in / extension id collision or already-imported user-id collision.
+    /// built-in id collision or already-imported user-id collision.
     /// Never overwrites an existing user row.
     pub async fn import(&self, req: ImportAssistantsRequest) -> Result<ImportAssistantsResult, AssistantError> {
         let mut result = ImportAssistantsResult::default();
@@ -835,10 +803,6 @@ impl AssistantService {
                 .unwrap_or_else(generate_user_id);
 
             if self.builtin.has(&id) {
-                result.skipped += 1;
-                continue;
-            }
-            if self.extension_registry.has_assistant(&id).await {
                 result.skipped += 1;
                 continue;
             }
@@ -903,11 +867,23 @@ impl AssistantService {
                 },
             };
 
+            let avatar = match self.normalize_user_avatar_input(&id, entry.avatar.as_deref()) {
+                Ok(value) => value,
+                Err(e) => {
+                    result.failed += 1;
+                    result.errors.push(ImportError {
+                        id,
+                        error: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
             let params = CreateAssistantParams {
                 id: &id,
                 name: &name,
                 description: entry.description.as_deref(),
-                avatar: entry.avatar.as_deref(),
+                avatar: avatar.as_deref(),
                 preset_agent_type: &resolved_agent_type,
                 enabled_skills: serialized.enabled_skills.as_deref(),
                 custom_skill_names: serialized.custom_skill_names.as_deref(),
@@ -957,12 +933,6 @@ impl AssistantService {
                     .and_then(|b| String::from_utf8(b).ok())
                     .unwrap_or_default())
             }
-            AssistantSource::Extension => {
-                // ResolvedAssistant doesn't expose rule content directly in
-                // the current backend; return empty until extension schema
-                // gains this field. Callers see empty == "no rule".
-                Ok(String::new())
-            }
             AssistantSource::User => {
                 let path = self.user_rule_path(id, locale);
                 Ok(read_file_or_empty(&path))
@@ -970,14 +940,11 @@ impl AssistantService {
         }
     }
 
-    /// Write an assistant rule file. User only; built-in / extension reject.
+    /// Write an assistant rule file. User only; built-ins reject.
     pub async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AssistantError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write rule for built-in assistant".into(),
-            )),
-            AssistantSource::Extension => Err(AssistantError::BadRequest(
-                "Cannot write rule for extension-contributed assistant".into(),
             )),
             AssistantSource::User => {
                 let path = self.user_rule_path(id, locale);
@@ -997,9 +964,6 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete rule for built-in assistant".into(),
             )),
-            AssistantSource::Extension => Err(AssistantError::BadRequest(
-                "Cannot delete rule for extension-contributed assistant".into(),
-            )),
             AssistantSource::User => Ok(remove_assistant_md_files(&self.user_rules_dir(), id)),
         }
     }
@@ -1007,7 +971,6 @@ impl AssistantService {
     pub async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AssistantError> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => Ok(String::new()),
-            AssistantSource::Extension => Ok(String::new()),
             AssistantSource::User => {
                 let path = self.user_skill_path(id, locale);
                 Ok(read_file_or_empty(&path))
@@ -1019,9 +982,6 @@ impl AssistantService {
         match self.classify_source(id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write skill for built-in assistant".into(),
-            )),
-            AssistantSource::Extension => Err(AssistantError::BadRequest(
-                "Cannot write skill for extension-contributed assistant".into(),
             )),
             AssistantSource::User => {
                 let path = self.user_skill_path(id, locale);
@@ -1040,9 +1000,6 @@ impl AssistantService {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete skill for built-in assistant".into(),
             )),
-            AssistantSource::Extension => Err(AssistantError::BadRequest(
-                "Cannot delete skill for extension-contributed assistant".into(),
-            )),
             AssistantSource::User => Ok(remove_assistant_md_files(&self.user_skills_dir(), id)),
         }
     }
@@ -1058,16 +1015,12 @@ impl AssistantService {
     ///   override when `AIONUI_BUILTIN_ASSISTANTS_PATH` is set).
     /// - User source → scan the user-writable avatars directory for a file
     ///   whose stem equals `id`.
-    /// - Extension source → `None`; the frontend serves those via
-    ///   `aion-asset://`.
-    ///
     /// Built-ins whose manifest `avatar` field is an inline emoji (and thus
     /// has no on-disk file) also return `None`; clients fall back to the
     /// text avatar for those.
     pub async fn avatar_asset(&self, id: &str) -> Option<AvatarAsset> {
         match self.classify_source(id).await {
             AssistantSource::Builtin => self.builtin.avatar_asset(id),
-            AssistantSource::Extension => None,
             AssistantSource::User => {
                 let dir = self.user_avatars_dir();
                 let entries = std::fs::read_dir(&dir).ok()?;
@@ -1104,6 +1057,77 @@ impl AssistantService {
 
     fn user_avatars_dir(&self) -> PathBuf {
         self.user_data_dir.join("assistant-avatars")
+    }
+
+    fn normalize_user_avatar_input(&self, id: &str, avatar: Option<&str>) -> Result<Option<String>, AssistantError> {
+        let Some(value) = avatar.map(str::trim).filter(|value| !value.is_empty()) else {
+            remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+            return Ok(None);
+        };
+
+        if !looks_like_avatar_asset(value) {
+            remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+            return Ok(Some(value.to_string()));
+        }
+
+        if let Some(source_assistant_id) = parse_assistant_avatar_route(value) {
+            if let Some(existing_avatar_path) = self.find_existing_user_avatar_file(&source_assistant_id) {
+                if source_assistant_id == id {
+                    return Ok(Some(existing_avatar_path.to_string_lossy().to_string()));
+                }
+                return self.persist_user_avatar_file(id, &existing_avatar_path).map(Some);
+            }
+            return Ok(Some(value.to_string()));
+        }
+
+        if let Some(source_path) = parse_local_avatar_path(value) {
+            return self.persist_user_avatar_file(id, &source_path).map(Some);
+        }
+
+        remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+        Ok(Some(value.to_string()))
+    }
+
+    fn persist_user_avatar_file(&self, id: &str, source_path: &Path) -> Result<String, AssistantError> {
+        let extension = source_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .ok_or_else(|| AssistantError::BadRequest("assistant avatar must have a file extension".into()))?;
+
+        if !is_supported_avatar_extension(&extension) {
+            return Err(AssistantError::BadRequest(format!(
+                "unsupported assistant avatar format: .{extension}"
+            )));
+        }
+
+        let destination_dir = self.user_avatars_dir();
+        std::fs::create_dir_all(&destination_dir)
+            .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
+        remove_assistant_avatar_files(&destination_dir, id);
+
+        let destination = destination_dir.join(format!("{id}.{extension}"));
+        std::fs::copy(source_path, &destination).map_err(|e| {
+            AssistantError::Internal(format!(
+                "copy assistant avatar from '{}' to '{}': {e}",
+                source_path.display(),
+                destination.display()
+            ))
+        })?;
+
+        Ok(destination.to_string_lossy().to_string())
+    }
+
+    fn find_existing_user_avatar_file(&self, id: &str) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(self.user_avatars_dir()).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_stem = path.file_stem().and_then(|stem| stem.to_str());
+            if file_stem == Some(id) {
+                return Some(path);
+            }
+        }
+        None
     }
 
     fn user_rule_path(&self, id: &str, locale: Option<&str>) -> PathBuf {
@@ -1208,19 +1232,17 @@ fn assistant_error_to_extension_error(error: AssistantError) -> ExtensionError {
 // Response conversion
 // ---------------------------------------------------------------------------
 
-/// Last-resort fallback for the assistant `preset_agent_type` when no
-/// provider list is reachable (extension-contributed rows, sync display
-/// conversions). `"aionrs"` is the only AionUI agent that does not require
-/// a third-party CLI to be installed, so it never fails the
-/// `Agent '<name>' CLI not found in PATH` guard at agent build time.
-///
-/// User- and import-created assistants take a different path: see
-/// [`AssistantService::resolve_default_agent_type`], which inspects the
-/// configured providers and returns a more specific default when possible.
-const DEFAULT_AGENT_TYPE: &str = "aionrs";
-
 fn avatar_display_value(definition: &AssistantDefinitionRow) -> Option<String> {
-    definition.avatar_value.clone()
+    match definition.avatar_type.as_str() {
+        "user_asset" => definition.avatar_value.as_deref().map(|value| {
+            if is_direct_avatar_url(value) {
+                value.to_string()
+            } else {
+                format!("/api/assistants/{}/avatar", definition.assistant_key)
+            }
+        }),
+        _ => definition.avatar_value.clone(),
+    }
 }
 
 fn serialize_avatar(source: &str, avatar: Option<&str>) -> (String, Option<String>) {
@@ -1244,13 +1266,39 @@ fn looks_like_avatar_asset(value: &str) -> bool {
     value.contains('/') || (std::path::Path::new(value).extension().is_some() && !value.starts_with('.'))
 }
 
+fn parse_local_avatar_path(value: &str) -> Option<PathBuf> {
+    let path = value
+        .strip_prefix("file://")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(value));
+    path.is_file().then_some(path)
+}
+
+fn is_supported_avatar_extension(extension: &str) -> bool {
+    matches!(extension, "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg")
+}
+
+fn is_direct_avatar_url(value: &str) -> bool {
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("data:")
+        || value.starts_with("file://")
+        || value.starts_with("/api/assistants/")
+}
+
+fn parse_assistant_avatar_route(value: &str) -> Option<String> {
+    let prefix = "/api/assistants/";
+    let suffix = "/avatar";
+    let id = value.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 fn definition_to_response(
     definition: &AssistantDefinitionRow,
     state: Option<&AssistantOverlayRow>,
 ) -> Result<AssistantResponse, AssistantError> {
     let source = match definition.source.as_str() {
         "builtin" => AssistantSource::Builtin,
-        "extension" => AssistantSource::Extension,
         _ => AssistantSource::User,
     };
     let models = match (
@@ -1314,7 +1362,6 @@ fn definition_to_detail_response(
         id: definition.assistant_key.clone(),
         source: match definition.source.as_str() {
             "builtin" => AssistantSource::Builtin,
-            "extension" => AssistantSource::Extension,
             _ => AssistantSource::User,
         },
         profile: AssistantProfileResponse {
@@ -1377,90 +1424,6 @@ fn definition_to_detail_response(
             last_mcp_ids,
         },
     })
-}
-
-fn extension_to_response(e: &ResolvedAssistant) -> AssistantResponse {
-    AssistantResponse {
-        id: e.id.clone(),
-        source: AssistantSource::Extension,
-        name: e.name.clone(),
-        name_i18n: HashMap::new(),
-        description: e.description.clone(),
-        description_i18n: HashMap::new(),
-        avatar: e.icon.clone(),
-        enabled: true,
-        sort_order: 0,
-        preset_agent_type: DEFAULT_AGENT_TYPE.to_string(),
-        enabled_skills: Vec::new(),
-        custom_skill_names: Vec::new(),
-        disabled_builtin_skills: Vec::new(),
-        context: e.context.clone(),
-        context_i18n: HashMap::new(),
-        prompts: Vec::new(),
-        prompts_i18n: HashMap::new(),
-        models: Vec::new(),
-        last_used_at: None,
-    }
-}
-
-fn extension_to_detail_response(e: &ResolvedAssistant) -> AssistantDetailResponse {
-    AssistantDetailResponse {
-        id: e.id.clone(),
-        source: AssistantSource::Extension,
-        profile: AssistantProfileResponse {
-            name: e.name.clone(),
-            name_i18n: HashMap::new(),
-            description: e.description.clone(),
-            description_i18n: HashMap::new(),
-            avatar: e.icon.clone(),
-        },
-        state: AssistantStateResponse {
-            enabled: true,
-            sort_order: 0,
-            last_used_at: None,
-        },
-        engine: AssistantEngineResponse {
-            agent_backend: DEFAULT_AGENT_TYPE.to_string(),
-        },
-        rules: AssistantRulesResponse {
-            content: e.context.clone().unwrap_or_default(),
-            storage_mode: "extension".to_string(),
-        },
-        prompts: AssistantPromptsResponse {
-            recommended: Vec::new(),
-            recommended_i18n: HashMap::new(),
-        },
-        defaults: AssistantDefaultsResponse {
-            model: AssistantDefaultScalarResponse {
-                mode: "unset".to_string(),
-                value: None,
-            },
-            permission: AssistantDefaultScalarResponse {
-                mode: "unset".to_string(),
-                value: None,
-            },
-            skills: AssistantDefaultListResponse {
-                mode: "auto".to_string(),
-                value: Vec::new(),
-            },
-            mcps: AssistantDefaultListResponse {
-                mode: "unset".to_string(),
-                value: Vec::new(),
-            },
-        },
-        capabilities: AssistantCapabilitiesResponse {
-            default_skill_ids: Vec::new(),
-            custom_skill_names: Vec::new(),
-            default_disabled_builtin_skill_ids: Vec::new(),
-        },
-        preferences: AssistantPreferencesResponse {
-            last_model_id: None,
-            last_permission_value: None,
-            last_skill_ids: Vec::new(),
-            last_disabled_builtin_skill_ids: Vec::new(),
-            last_mcp_ids: Vec::new(),
-        },
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1774,8 +1737,6 @@ mod tests {
         SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
         SqliteProviderRepository, init_database_memory,
     };
-    use aionui_extension::ExtensionStateStore;
-    use aionui_realtime::BroadcastEventBus;
     use tempfile::TempDir;
 
     struct Fixture {
@@ -1858,10 +1819,6 @@ mod tests {
         .unwrap();
         let builtin_reg = Arc::new(BuiltinAssistantRegistry::load_from_dir(assets_dir));
 
-        let event_bus = Arc::new(BroadcastEventBus::new(8));
-        let ext_state_store = ExtensionStateStore::new(tmp.path().join("ext-states.json"));
-        let extension_registry = ExtensionRegistry::new(ext_state_store, event_bus, "1.0.0".to_string());
-
         let service = AssistantService::new(
             db.pool().clone(),
             definition_repo.clone(),
@@ -1871,7 +1828,6 @@ mod tests {
             orepo,
             provider_repo.clone(),
             builtin_reg,
-            extension_registry,
             tmp.path().to_path_buf(),
         );
         service.bootstrap_assistant_storage().await.unwrap();
@@ -2642,10 +2598,6 @@ mod tests {
         let orepo: Arc<dyn IAssistantOverrideRepository> =
             Arc::new(SqliteAssistantOverrideRepository::new(db.pool().clone()));
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-        let event_bus = Arc::new(BroadcastEventBus::new(8));
-        let ext_state_store = ExtensionStateStore::new(tmp.path().join("ext-states.json"));
-        let extension_registry = ExtensionRegistry::new(ext_state_store, event_bus, "1.0.0".to_string());
-
         let service = AssistantService::new(
             db.pool().clone(),
             definition_repo,
@@ -2655,7 +2607,6 @@ mod tests {
             orepo,
             provider_repo,
             builtin_reg,
-            extension_registry,
             tmp.path().to_path_buf(),
         );
         let content = service.read_rule("builtin-office", Some("en-US")).await.unwrap();

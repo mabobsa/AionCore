@@ -847,14 +847,19 @@ async fn rebuild_legacy_assistant_unification_schema(pool: &SqlitePool) -> Resul
     let mut definitions = Vec::with_capacity(definition_rows.len());
     for row in definition_rows {
         if definitions_use_internal_identity {
+            let source: String = row.get("source");
+            let owner_type: String = row.get("owner_type");
+            if source == "extension" || owner_type == "extension" {
+                continue;
+            }
             let definition_id: String = row.get("definition_id");
             let assistant_key: String = row.get("assistant_key");
             definition_id_map.insert(assistant_key.clone(), definition_id.clone());
             definitions.push((
                 definition_id,
                 assistant_key,
-                row.get::<String, _>("source"),
-                row.get::<String, _>("owner_type"),
+                source,
+                owner_type,
                 row.get::<Option<String>, _>("source_ref"),
                 row.get::<Option<String>, _>("source_version"),
                 row.get::<Option<String>, _>("source_hash"),
@@ -885,8 +890,12 @@ async fn rebuild_legacy_assistant_unification_schema(pool: &SqlitePool) -> Resul
                 row.get::<Option<i64>, _>("deleted_at"),
             ));
         } else {
-            let assistant_key: String = row.get("id");
             let source: String = row.get("source");
+            let owner_type: String = row.get("owner_type");
+            if source == "extension" || owner_type == "extension" {
+                continue;
+            }
+            let assistant_key: String = row.get("id");
             let avatar: Option<String> = row.get("avatar");
             let definition_id = aionui_common::generate_prefixed_id("asstdef");
             let (avatar_type, avatar_value) = infer_avatar_storage(&source, avatar.as_deref());
@@ -895,7 +904,7 @@ async fn rebuild_legacy_assistant_unification_schema(pool: &SqlitePool) -> Resul
                 definition_id,
                 assistant_key,
                 source,
-                row.get::<String, _>("owner_type"),
+                owner_type,
                 row.get::<Option<String>, _>("source_ref"),
                 row.get::<Option<String>, _>("source_version"),
                 row.get::<Option<String>, _>("source_hash"),
@@ -1110,9 +1119,9 @@ async fn create_final_assistant_unification_tables(tx: &mut sqlx::Transaction<'_
             definition_id                      TEXT PRIMARY KEY,
             assistant_key                      TEXT    NOT NULL,
             source                             TEXT    NOT NULL
-                                                       CHECK (source IN ('builtin', 'user', 'generated', 'extension')),
+                                                       CHECK (source IN ('builtin', 'user', 'generated')),
             owner_type                         TEXT    NOT NULL
-                                                       CHECK (owner_type IN ('system', 'user', 'extension')),
+                                                       CHECK (owner_type IN ('system', 'user')),
             source_ref                         TEXT,
             source_version                     TEXT,
             source_hash                        TEXT,

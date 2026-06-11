@@ -321,6 +321,173 @@ CREATE TABLE assistant_definitions (
 }
 
 #[tokio::test]
+async fn idempotent_reinit_drops_legacy_extension_assistant_definitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+
+    let db = init_database(&path).await.unwrap();
+    db.close().await;
+
+    let pool = open_file_pool(&path).await;
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE assistant_preferences")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE assistant_overlays")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE assistant_definitions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+CREATE TABLE assistant_definitions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    owner_type TEXT NOT NULL,
+    source_ref TEXT,
+    source_version TEXT,
+    source_hash TEXT,
+    name TEXT NOT NULL,
+    name_i18n TEXT NOT NULL DEFAULT '{}',
+    description TEXT,
+    description_i18n TEXT NOT NULL DEFAULT '{}',
+    avatar TEXT,
+    agent_backend TEXT NOT NULL,
+    rule_resource_type TEXT NOT NULL,
+    rule_resource_ref TEXT,
+    rule_inline_content TEXT,
+    recommended_prompts TEXT NOT NULL DEFAULT '[]',
+    recommended_prompts_i18n TEXT NOT NULL DEFAULT '{}',
+    default_model_mode TEXT NOT NULL,
+    default_model_value TEXT,
+    default_permission_mode TEXT NOT NULL,
+    default_permission_value TEXT,
+    default_skills_mode TEXT NOT NULL,
+    default_skill_ids TEXT NOT NULL DEFAULT '[]',
+    custom_skill_names TEXT NOT NULL DEFAULT '[]',
+    default_disabled_builtin_skill_ids TEXT NOT NULL DEFAULT '[]',
+    default_mcps_mode TEXT NOT NULL,
+    default_mcp_ids TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    deleted_at INTEGER
+)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE UNIQUE INDEX idx_assistant_definitions_source_ref
+         ON assistant_definitions(source, source_ref)
+         WHERE source_ref IS NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("CREATE INDEX idx_assistant_definitions_source ON assistant_definitions(source)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE INDEX idx_assistant_definitions_agent_backend ON assistant_definitions(agent_backend)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE assistant_states (
+            assistant_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            agent_backend_override TEXT,
+            last_used_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE assistant_preferences (
+            assistant_id TEXT PRIMARY KEY,
+            last_model_id TEXT,
+            last_permission_value TEXT,
+            last_skill_ids TEXT NOT NULL DEFAULT '[]',
+            last_disabled_builtin_skill_ids TEXT NOT NULL DEFAULT '[]',
+            last_mcp_ids TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assistant_definitions (
+            id, source, owner_type, source_ref, source_version, source_hash,
+            name, name_i18n, description, description_i18n, avatar,
+            agent_backend, rule_resource_type, rule_resource_ref, rule_inline_content,
+            recommended_prompts, recommended_prompts_i18n,
+            default_model_mode, default_model_value,
+            default_permission_mode, default_permission_value,
+            default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
+            default_mcps_mode, default_mcp_ids, created_at, updated_at, deleted_at
+        ) VALUES (
+            'ext-helper', 'extension', 'extension', 'ext-helper', NULL, NULL,
+            'Helper', '{}', 'desc', '{}', NULL,
+            'aionrs', 'inline', NULL, 'ctx',
+            '[]', '{}',
+            'unset', NULL,
+            'unset', NULL,
+            'fixed', '[]', '[]', '[]',
+            'unset', '[]', 1, 2, NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assistant_states (assistant_id, enabled, sort_order, agent_backend_override, last_used_at, created_at, updated_at)
+         VALUES ('ext-helper', 1, 3, NULL, NULL, 1, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assistant_preferences (assistant_id, last_model_id, last_permission_value, last_skill_ids,
+            last_disabled_builtin_skill_ids, last_mcp_ids, created_at, updated_at)
+         VALUES ('ext-helper', 'gpt-4.1', NULL, '[]', '[]', '[]', 1, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
+    pool.close().await;
+
+    let db = init_database(&path).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assistant_definitions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let overlay_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assistant_overlays")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(overlay_count, 0);
+    let preference_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assistant_preferences")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(preference_count, 0);
+    db.close().await;
+}
+
+#[tokio::test]
 async fn idempotent_reinit_repairs_stale_assistant_definition_default_mode_constraints() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");

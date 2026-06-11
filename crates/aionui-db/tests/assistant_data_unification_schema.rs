@@ -65,3 +65,56 @@ async fn assistant_definition_table_has_expected_default_columns() {
             .unwrap_or_default();
     assert!(preference_columns.iter().any(|name| name == "definition_id"));
 }
+
+#[tokio::test]
+async fn assistant_definition_table_rejects_extension_source_and_owner_type() {
+    let db = init_database_memory().await.unwrap();
+
+    let source_err = sqlx::query(
+        r#"
+        INSERT INTO assistant_definitions (
+            definition_id, assistant_key, source, owner_type, source_ref,
+            name, name_i18n, description_i18n, avatar_type, agent_backend,
+            rule_resource_type, recommended_prompts, recommended_prompts_i18n,
+            default_model_mode, default_permission_mode, default_skills_mode, default_skill_ids,
+            custom_skill_names, default_disabled_builtin_skill_ids, default_mcps_mode, default_mcp_ids,
+            created_at, updated_at
+        ) VALUES (
+            'd-ext-source', 'ext-source', 'extension', 'system', 'ext-source',
+            'Ext Source', '{}', '{}', 'none', 'aionrs',
+            'none', '[]', '{}',
+            'unset', 'unset', 'fixed', '[]',
+            '[]', '[]', 'unset', '[]',
+            1, 1
+        )
+        "#,
+    )
+    .execute(db.pool())
+    .await
+    .unwrap_err();
+    assert!(source_err.to_string().contains("CHECK constraint failed"));
+
+    let owner_err = sqlx::query(
+        r#"
+        INSERT INTO assistant_definitions (
+            definition_id, assistant_key, source, owner_type, source_ref,
+            name, name_i18n, description_i18n, avatar_type, agent_backend,
+            rule_resource_type, recommended_prompts, recommended_prompts_i18n,
+            default_model_mode, default_permission_mode, default_skills_mode, default_skill_ids,
+            custom_skill_names, default_disabled_builtin_skill_ids, default_mcps_mode, default_mcp_ids,
+            created_at, updated_at
+        ) VALUES (
+            'd-ext-owner', 'ext-owner', 'builtin', 'extension', 'ext-owner',
+            'Ext Owner', '{}', '{}', 'none', 'aionrs',
+            'none', '[]', '{}',
+            'unset', 'unset', 'fixed', '[]',
+            '[]', '[]', 'unset', '[]',
+            1, 1
+        )
+        "#,
+    )
+    .execute(db.pool())
+    .await
+    .unwrap_err();
+    assert!(owner_err.to_string().contains("CHECK constraint failed"));
+}
