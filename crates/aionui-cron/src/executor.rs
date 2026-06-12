@@ -128,7 +128,8 @@ impl JobExecutor {
             return self.handle_busy(job);
         }
 
-        self.execute_inner(job, &target_conversation_id, saved_skill.as_ref()).await
+        self.execute_inner(job, &target_conversation_id, saved_skill.as_ref())
+            .await
     }
 
     pub(crate) async fn prepare_run_now(&self, job: &CronJob) -> Result<PreparedExecution, CronError> {

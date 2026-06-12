@@ -603,10 +603,7 @@ async fn rn1b_run_now_returns_conflict_when_conversation_is_busy() {
     let body = body_json(resp).await;
     assert_eq!(body["code"], "CONFLICT");
     assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("already running"),
+        body["error"].as_str().unwrap_or_default().contains("already running"),
         "busy run-now should surface conversation busy semantics"
     );
 
