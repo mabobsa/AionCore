@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.29](https://github.com/iOfficeAI/AionCore/compare/v0.1.28...v0.1.29) (2026-06-12)
+
+
+### Features
+
+* **stt:** streaming transcription proxy over websocket ([#455](https://github.com/iOfficeAI/AionCore/issues/455)) ([1c19a8b](https://github.com/iOfficeAI/AionCore/commit/1c19a8b9a80be665d30310071c0c12bc95881c11))
+
+
+### Bug Fixes
+
+* **office:** probe star-office preferred_url host as given ([#456](https://github.com/iOfficeAI/AionCore/issues/456)) ([3c2149c](https://github.com/iOfficeAI/AionCore/commit/3c2149ca92aad8a0e19fae0d8083083500f60267))
+
 ## [0.1.28](https://github.com/iOfficeAI/AionCore/compare/v0.1.27...v0.1.28) (2026-06-11)
 
 
