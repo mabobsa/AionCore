@@ -298,14 +298,14 @@ impl AgentSendError {
             ),
             AcpError::NotConnected => Self::new(
                 "AionUI lost its Agent protocol connection",
-                AgentErrorCode::AionuiInternalError,
-                AgentErrorOwnership::Aionui,
+                AgentErrorCode::UserAgentDisconnected,
+                AgentErrorOwnership::UserAgent,
                 Some(detail),
                 true,
-                true,
+                false,
                 resolution(
-                    AgentErrorResolutionKind::SendFeedback,
-                    Some(AgentErrorResolutionTarget::Feedback),
+                    AgentErrorResolutionKind::ReconnectAgent,
+                    Some(AgentErrorResolutionTarget::AgentSettings),
                 ),
             ),
             AcpError::AgentInternal { .. } => unknown_upstream_error(detail),
@@ -495,6 +495,16 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
         return Some(agent_session_error(
             "The Agent session was not found",
             AgentErrorCode::UserAgentSessionNotFound,
+        ));
+    }
+    if lower.contains("native binary not found")
+        || (lower.contains("managed") && lower.contains("platform binary missing"))
+    {
+        return Some(agent_error(
+            "The selected Agent failed to start",
+            AgentErrorCode::UserAgentStartupFailed,
+            false,
+            AgentErrorResolutionKind::CheckAgentInstallation,
         ));
     }
     if lower.contains("command not found") {
@@ -1173,6 +1183,27 @@ mod tests {
     }
 
     #[test]
+    fn not_connected_maps_to_user_agent_disconnected() {
+        let disconnected = AgentSendError::from(AcpError::NotConnected);
+        assert_eq!(
+            disconnected.stream_error.code,
+            Some(AgentErrorCode::UserAgentDisconnected)
+        );
+        assert_eq!(
+            disconnected.stream_error.ownership,
+            Some(AgentErrorOwnership::UserAgent)
+        );
+        assert_eq!(
+            disconnected
+                .stream_error
+                .resolution
+                .as_ref()
+                .map(|resolution| resolution.kind),
+            Some(AgentErrorResolutionKind::ReconnectAgent)
+        );
+    }
+
+    #[test]
     fn classifies_acp_internal_provider_failure_from_structured_message() {
         assert_acp_classification(
             AcpError::AgentInternal {
@@ -1297,6 +1328,37 @@ mod tests {
             AgentErrorOwnership::UserAgent,
             AgentErrorResolutionKind::CheckLocalCommand,
         );
+        let native_binary_missing = "Agent internal error (code -32603) ({\"details\":\"Claude native binary not found for win32-x64. Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.\"})";
+        assert_classification(
+            native_binary_missing,
+            AgentErrorCode::UserAgentStartupFailed,
+            AgentErrorOwnership::UserAgent,
+            AgentErrorResolutionKind::CheckAgentInstallation,
+        );
+        let err = AgentSendError::from_agent_error(AgentError::bad_gateway(native_binary_missing));
+        assert_eq!(err.stream_error().retryable, Some(false));
+        assert_eq!(
+            err.stream_error().resolution.and_then(|value| value.target),
+            Some(AgentErrorResolutionTarget::AgentSettings)
+        );
+
+        for managed_binary_missing in [
+            "expected managed Claude ACP platform binary missing: C:\\Users\\user\\AppData\\Roaming\\AionUi\\aionui\\runtime\\acp\\claude-agent-acp\\0.39.0\\win32-x64\\node_modules\\@anthropic-ai\\claude-agent-sdk-win32-x64\\claude.exe",
+            "expected managed Codex ACP platform binary missing: C:\\Users\\user\\AppData\\Roaming\\AionUi\\aionui\\runtime\\acp\\codex-acp\\0.14.0\\win32-x64\\node_modules\\@zed-industries\\codex-acp-win32-x64\\bin\\codex-acp.exe",
+        ] {
+            assert_classification(
+                managed_binary_missing,
+                AgentErrorCode::UserAgentStartupFailed,
+                AgentErrorOwnership::UserAgent,
+                AgentErrorResolutionKind::CheckAgentInstallation,
+            );
+            let err = AgentSendError::from_agent_error(AgentError::bad_gateway(managed_binary_missing));
+            assert_eq!(err.stream_error().retryable, Some(false));
+            assert_eq!(
+                err.stream_error().resolution.and_then(|value| value.target),
+                Some(AgentErrorResolutionTarget::AgentSettings)
+            );
+        }
         assert_classification(
             "Agent internal error (code -32603) {\"message\":\"Missing environment variable: 'OMLX API KEY'\"}",
             AgentErrorCode::UserAgentMissingEnv,

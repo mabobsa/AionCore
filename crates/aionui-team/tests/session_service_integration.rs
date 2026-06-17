@@ -11,19 +11,26 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{AcpBuildExtra, AddAgentRequest, CreateTeamRequest, TeamAgentInput, WebSocketMessage};
-use aionui_common::{AgentKillReason, PaginatedResult, ProviderWithModel};
+use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
-    AcpSessionRow, AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+    AgentMetadataRow, ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessageRowUpdate,
-    MessageSearchRow, PersistedSessionState, SaveRuntimeStateParams, SortOrder,
+    ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
+    IProviderRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
 };
 use aionui_realtime::EventBroadcaster;
 
-use aionui_conversation::ConversationService;
-use aionui_team::TeamSessionService;
+use aionui_team::ports::{
+    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
+    AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
+};
+use aionui_team::session::SpawnAgentRequest;
+use aionui_team::{
+    TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
+    TeamConversationProvisioningPort, TeamProjectionMessageStore,
+};
+use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
 
 // ---------------------------------------------------------------------------
@@ -47,6 +54,26 @@ impl MockConversationRepo {
             .iter()
             .find(|c| c.id == id)
             .and_then(|c| serde_json::from_str(&c.extra).ok())
+    }
+
+    fn conversation_count(&self) -> usize {
+        self.conversations.lock().unwrap().len()
+    }
+
+    fn patch_extra(&self, id: &str, patch: serde_json::Value) -> Result<(), DbError> {
+        let mut convs = self.conversations.lock().unwrap();
+        let conv = convs
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or_else(|| DbError::NotFound(id.to_owned()))?;
+        let mut extra: serde_json::Value = serde_json::from_str(&conv.extra).unwrap_or_else(|_| serde_json::json!({}));
+        if let (Some(target), Some(source)) = (extra.as_object_mut(), patch.as_object()) {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        conv.extra = serde_json::to_string(&extra).unwrap();
+        Ok(())
     }
 }
 
@@ -167,6 +194,347 @@ impl EventBroadcaster for NullBroadcaster {
     fn broadcast(&self, _msg: WebSocketMessage<serde_json::Value>) {}
 }
 
+struct NoopTurnPort;
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for NoopTurnPort {
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone().expect("team run id"),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: "turn-test".into(),
+            })
+            .await;
+        }
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id: "turn-test".into(),
+            status: AgentTurnStatus::Completed,
+            runtime: None,
+        })
+    }
+}
+
+fn noop_turn_port() -> Arc<dyn AgentTurnExecutionPort> {
+    Arc::new(NoopTurnPort)
+}
+
+struct NoopCancellationPort;
+
+#[async_trait::async_trait]
+impl AgentTurnCancellationPort for NoopCancellationPort {
+    async fn cancel_agent_turn(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _turn_id: &str,
+    ) -> Result<(), AgentTurnExecutionError> {
+        Ok(())
+    }
+}
+
+fn noop_cancellation_port() -> Arc<dyn AgentTurnCancellationPort> {
+    Arc::new(NoopCancellationPort)
+}
+
+struct FakeConversationPorts {
+    repo: Arc<MockConversationRepo>,
+    broadcaster: Arc<dyn EventBroadcaster>,
+    workspace_root: std::path::PathBuf,
+    fail_team_temp_create: std::sync::atomic::AtomicBool,
+    fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
+}
+
+impl FakeConversationPorts {
+    fn new(repo: Arc<MockConversationRepo>, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+        let workspace_root =
+            std::env::temp_dir().join(format!("aionui-team-fake-workspaces-{}", aionui_common::generate_id()));
+        Self {
+            repo,
+            broadcaster,
+            workspace_root,
+            fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
+            fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TeamConversationProvisioningPort for FakeConversationPorts {
+    async fn create_team_conversation(
+        &self,
+        request: TeamConversationCreateRequest,
+    ) -> Result<TeamConversationCreateResult, aionui_team::TeamError> {
+        let id = aionui_common::generate_id();
+        let now = aionui_common::now_ms();
+        let workspace = request
+            .extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let path = self.workspace_root.join("conversations").join(format!("acp-temp-{id}"));
+                std::fs::create_dir_all(&path).unwrap();
+                path.to_string_lossy().into_owned()
+            });
+        let mut extra = request.extra;
+        extra["workspace"] = serde_json::Value::String(workspace.clone());
+        self.repo
+            .create(&ConversationRow {
+                id: id.clone(),
+                user_id: request.user_id,
+                name: request.name,
+                r#type: request.agent_type.serde_name().to_owned(),
+                pinned: false,
+                pinned_at: None,
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::to_string(&extra).unwrap(),
+                model: request
+                    .top_level_model
+                    .map(|m| serde_json::to_string(&m).expect("serialize provider model")),
+                status: Some("pending".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        Ok(TeamConversationCreateResult {
+            conversation_id: id,
+            workspace,
+        })
+    }
+
+    async fn adopt_team_conversation(
+        &self,
+        request: TeamConversationAdoptRequest,
+    ) -> Result<(), aionui_team::TeamError> {
+        self.repo
+            .update(
+                &request.conversation_id,
+                &ConversationRowUpdate {
+                    name: None,
+                    model: None,
+                    pinned: None,
+                    pinned_at: None,
+                    extra: Some(serde_json::to_string(&request.extra).unwrap()),
+                    status: None,
+                    updated_at: Some(aionui_common::now_ms()),
+                },
+            )
+            .await?;
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "conversation.listChanged",
+            serde_json::json!({
+                "conversation_id": request.conversation_id,
+                "action": "updated",
+            }),
+        ));
+        Ok(())
+    }
+
+    async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, aionui_team::TeamError> {
+        Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
+            extra
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }))
+    }
+
+    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
+        if self
+            .fail_team_temp_create
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(aionui_team::TeamError::InvalidRequest(
+                "failed to create Team temporary workspace for test".into(),
+            ));
+        }
+        let path = self
+            .workspace_root
+            .join("conversations")
+            .join(format!("team-temp-{team_id}"));
+        std::fs::create_dir_all(&path).unwrap();
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    async fn patch_runtime_config(
+        &self,
+        conversation_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<(), aionui_team::TeamError> {
+        if patch.get("workspace").is_some()
+            && self
+                .fail_leader_workspace_patch
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(aionui_team::TeamError::InvalidRequest(
+                "forced leader workspace patch failure".into(),
+            ));
+        }
+        let mut extra = self
+            .repo
+            .get_extra(conversation_id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(target), Some(source)) = (extra.as_object_mut(), patch.as_object()) {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        self.repo
+            .update(
+                conversation_id,
+                &ConversationRowUpdate {
+                    name: None,
+                    model: None,
+                    pinned: None,
+                    pinned_at: None,
+                    extra: Some(serde_json::to_string(&extra).unwrap()),
+                    status: None,
+                    updated_at: Some(aionui_common::now_ms()),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), aionui_team::TeamError> {
+        self.patch_runtime_config(conversation_id, serde_json::json!({ "session_mode": mode }))
+            .await
+    }
+
+    async fn warmup_agent_process(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), aionui_team::TeamError> {
+        let row = self
+            .repo
+            .get(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| {
+                aionui_team::TeamError::InvalidRequest(format!("conversation not found: {conversation_id}"))
+            })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra)?;
+        let team = aionui_api_types::TeamSessionBinding::from_extra_value(&extra)?;
+        let config: AcpBuildExtra = serde_json::from_value(extra.clone()).unwrap_or_default();
+        let workspace = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let provider_id = extra
+            .get("provider_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("acp")
+            .to_owned();
+        let model = extra
+            .get("current_model_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("claude")
+            .to_owned();
+        let context = AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: row.id.clone(),
+                user_id: row.user_id,
+                agent_type: AgentType::Acp,
+                source: row.source,
+            },
+            workspace: WorkspaceContext {
+                path: workspace.clone(),
+                stored_path: workspace,
+                is_custom: false,
+            },
+            model: ProviderWithModel {
+                provider_id,
+                model,
+                use_model: None,
+            },
+            skills: config.skills.clone(),
+            team: team.clone(),
+            kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
+                config,
+                team: team.clone(),
+                belongs_to_team: team.is_some(),
+                session_id: None,
+                session_snapshot: None,
+            })),
+        };
+        task_manager
+            .get_or_build_task(conversation_id, BuildTaskOptions::new(context))
+            .await
+            .map_err(|error| {
+                aionui_team::TeamError::InvalidRequest(format!("failed to warm up agent process: {error}"))
+            })?;
+        Ok(())
+    }
+
+    async fn delete_team_conversation(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), aionui_team::TeamError> {
+        self.repo.delete(conversation_id).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TeamProjectionMessageStore for FakeConversationPorts {
+    fn mint_message_id(&self) -> String {
+        aionui_common::generate_id()
+    }
+
+    async fn find_projected_message(
+        &self,
+        conversation_id: &str,
+        msg_id: &str,
+        msg_type: &str,
+    ) -> Result<Option<MessageRow>, aionui_team::TeamError> {
+        Ok(self
+            .repo
+            .get_message_by_msg_id(conversation_id, msg_id, msg_type)
+            .await?)
+    }
+
+    async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), aionui_team::TeamError> {
+        self.repo.insert_message(row).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TeamConversationLookupPort for FakeConversationPorts {
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
+        let Some(row) = self.repo.get(conversation_id).await? else {
+            return Ok(None);
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(Some(TeamConversationBindingLookup {
+            conversation_id: row.id,
+            user_id: row.user_id,
+            team_id: extra
+                .get("teamId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            slot_id: extra
+                .get("slot_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            role: extra.get("role").and_then(serde_json::Value::as_str).map(str::to_owned),
+        }))
+    }
+}
+
 #[derive(Default)]
 struct RecordingBroadcaster {
     events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -201,6 +569,7 @@ impl EventBroadcaster for RecordingBroadcaster {
 struct FullMockTeamRepo {
     inner: MockTeamRepo,
     teams: std::sync::Mutex<Vec<aionui_db::models::TeamRow>>,
+    fail_workspace_update: std::sync::Mutex<bool>,
 }
 
 impl FullMockTeamRepo {
@@ -208,7 +577,12 @@ impl FullMockTeamRepo {
         Self {
             inner: MockTeamRepo::new(),
             teams: std::sync::Mutex::new(Vec::new()),
+            fail_workspace_update: std::sync::Mutex::new(false),
         }
+    }
+
+    fn fail_workspace_update(&self) {
+        *self.fail_workspace_update.lock().unwrap() = true;
     }
 }
 
@@ -221,10 +595,23 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn list_teams(&self) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().clone())
     }
+    async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
+        Ok(self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|team| team.user_id == user_id)
+            .cloned()
+            .collect())
+    }
     async fn get_team(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
     }
     async fn update_team(&self, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
+        if params.workspace.is_some() && *self.fail_workspace_update.lock().unwrap() {
+            return Err(DbError::Init("forced workspace writeback failure".into()));
+        }
         let mut teams = self.teams.lock().unwrap();
         let team = teams
             .iter_mut()
@@ -232,6 +619,9 @@ impl ITeamRepository for FullMockTeamRepo {
             .ok_or_else(|| DbError::NotFound(id.to_owned()))?;
         if let Some(ref name) = params.name {
             team.name = name.clone();
+        }
+        if let Some(ref workspace) = params.workspace {
+            team.workspace = workspace.clone();
         }
         if let Some(ref agents) = params.agents {
             team.agents = agents.clone();
@@ -310,25 +700,6 @@ impl ITeamRepository for FullMockTeamRepo {
 // Helpers
 // ---------------------------------------------------------------------------
 
-struct StubSkillResolver;
-#[async_trait::async_trait]
-impl aionui_conversation::skill_resolver::SkillResolver for StubSkillResolver {
-    async fn auto_inject_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-    async fn resolve_skills(&self, _names: &[String]) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
-        Vec::new()
-    }
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &std::path::Path,
-        _rel_dirs: &[&str],
-        _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
-    ) -> usize {
-        0
-    }
-}
-
 #[derive(Default)]
 struct StubAgentMetadataRepo {
     rows_by_id: HashMap<String, AgentMetadataRow>,
@@ -394,44 +765,6 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     }
 }
 
-struct StubAcpSessionRepo;
-
-#[async_trait::async_trait]
-impl IAcpSessionRepository for StubAcpSessionRepo {
-    async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
-        Ok(None)
-    }
-    async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
-        Ok(AcpSessionRow {
-            conversation_id: params.conversation_id.to_owned(),
-            agent_backend: params.agent_backend.to_owned(),
-            agent_source: params.agent_source.to_owned(),
-            agent_id: params.agent_id.to_owned(),
-            session_id: None,
-            session_status: "created".to_owned(),
-            session_config: "{}".to_owned(),
-            last_active_at: None,
-            suspended_at: None,
-        })
-    }
-    async fn update_session_id(&self, _conversation_id: &str, _session_id: &str) -> Result<bool, DbError> {
-        Ok(false)
-    }
-    async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
-        Ok(false)
-    }
-    async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
-        Ok(None)
-    }
-    async fn save_runtime_state(
-        &self,
-        _conversation_id: &str,
-        _params: &SaveRuntimeStateParams<'_>,
-    ) -> Result<bool, DbError> {
-        Ok(false)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Counting task manager — wraps WorkerTaskManagerImpl so tests can assert
 // kill / get_or_build_task call counts by conversation id.
@@ -456,8 +789,8 @@ impl CountingTaskManager {
         }
     }
 
-    fn reset(&self) {
-        self.inner.clear();
+    async fn reset(&self) {
+        self.inner.clear().await;
         *self.calls.lock().unwrap() = TaskManagerCalls::default();
     }
 
@@ -495,8 +828,8 @@ impl IWorkerTaskManager for CountingTaskManager {
         let _ = self.kill(conversation_id, reason);
         Box::pin(std::future::ready(()))
     }
-    fn clear(&self) {
-        self.inner.clear()
+    async fn clear(&self) {
+        self.inner.clear().await
     }
     fn active_count(&self) -> usize {
         self.inner.active_count()
@@ -641,8 +974,10 @@ fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTa
             use_model: None,
         },
         skills: Vec::new(),
+        team: None,
         kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
             config: AcpBuildExtra::default(),
+            team: None,
             belongs_to_team: false,
             session_id: None,
             session_snapshot: None,
@@ -698,35 +1033,84 @@ fn setup_with_factory_and_metadata_and_conversation_repo(
     Arc<CountingTaskManager>,
     Arc<MockConversationRepo>,
 ) {
-    let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
+    let (svc, _, task_manager, conv_repo) =
+        setup_with_factory_metadata_team_repo_and_conversation_repo(factory, agent_metadata_repo);
+    (svc, task_manager, conv_repo)
+}
+
+fn setup_with_factory_metadata_team_repo_and_conversation_repo(
+    factory: AgentFactory,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<MockConversationRepo>,
+) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
-    let conv_repo_dyn: Arc<dyn IConversationRepository> = conv_repo.clone();
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager = Arc::new(CountingTaskManager::new(factory));
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
-    let conv_service = ConversationService::new(
-        std::env::temp_dir(),
-        broadcaster.clone(),
-        Arc::new(StubSkillResolver),
-        task_manager_dyn.clone(),
-        conv_repo_dyn,
-        agent_metadata_repo.clone(),
-        acp_session_repo,
-    );
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
     let svc = TeamSessionService::new(
-        team_repo,
+        team_repo_dyn,
         agent_metadata_repo,
         provider_repo,
-        conv_service,
+        conversation_port,
+        projection_store,
+        lookup_port,
         broadcaster,
         task_manager_dyn,
+        noop_turn_port(),
+        noop_cancellation_port(),
         backend_binary_path,
         None,
     );
-    (svc, task_manager, conv_repo)
+    (svc, team_repo, task_manager, conv_repo)
+}
+
+fn setup_with_ports_team_repo_and_conversation_repo(
+    factory: AgentFactory,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<FakeConversationPorts>,
+    Arc<MockConversationRepo>,
+) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone(), broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports.clone();
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(factory));
+    let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let svc = TeamSessionService::new(
+        team_repo_dyn,
+        agent_metadata_repo,
+        provider_repo,
+        conversation_port,
+        projection_store,
+        lookup_port,
+        broadcaster,
+        task_manager,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        backend_binary_path,
+        None,
+    );
+    (svc, team_repo, conversation_ports, conv_repo)
 }
 
 fn setup() -> Arc<TeamSessionService> {
@@ -735,30 +1119,28 @@ fn setup() -> Arc<TeamSessionService> {
 
 fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<RecordingBroadcaster>) {
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(FullMockTeamRepo::new());
-    let conv_repo: Arc<dyn IConversationRepository> = Arc::new(MockConversationRepo::new());
+    let conv_repo = Arc::new(MockConversationRepo::new());
     let recorder = Arc::new(RecordingBroadcaster::new());
     let broadcaster: Arc<dyn EventBroadcaster> = recorder.clone();
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo, broadcaster.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
-    let conv_service = ConversationService::new(
-        std::env::temp_dir(),
-        broadcaster.clone(),
-        Arc::new(StubSkillResolver),
-        task_manager.clone(),
-        conv_repo,
-        agent_metadata_repo.clone(),
-        acp_session_repo,
-    );
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
     let svc = TeamSessionService::new(
         team_repo,
         agent_metadata_repo,
         provider_repo,
-        conv_service,
+        conversation_port,
+        projection_store,
+        lookup_port,
         broadcaster,
         task_manager,
+        noop_turn_port(),
+        noop_cancellation_port(),
         backend_binary_path,
         None,
     );
@@ -822,9 +1204,21 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
     ]
 }
 
-fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
-    svc.stop_session(team_id);
-    tm.reset();
+async fn reset_auto_started_session(svc: &Arc<TeamSessionService>, tm: &Arc<CountingTaskManager>, team_id: &str) {
+    svc.stop_session("user1", team_id).await.unwrap();
+    tm.reset().await;
+}
+
+async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
+    repo.update_team(
+        team_id,
+        &aionui_db::UpdateTeamParams {
+            workspace: Some(workspace.to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("force workspace");
 }
 
 // ===========================================================================
@@ -852,6 +1246,74 @@ async fn tc1_create_team_with_multiple_agents() {
     assert_eq!(resp.agents[1].role, "teammate");
     assert!(resp.lead_agent_id.is_some());
     assert_eq!(resp.lead_agent_id, Some(resp.agents[0].slot_id.clone()));
+}
+
+#[tokio::test]
+async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_agents() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let workspace_dir =
+        std::env::temp_dir().join(format!("aionui-team-user-workspace-{}", aionui_common::generate_id()));
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let workspace = workspace_dir.to_string_lossy().into_owned();
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Shared".into(),
+                agents: two_agent_input(),
+                workspace: Some(workspace.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert_eq!(got.workspace, workspace);
+    for agent in &got.agents {
+        let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+        assert_eq!(
+            extra.get("workspace").and_then(serde_json::Value::as_str),
+            Some(workspace.as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initial_agents() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Auto Shared".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(!got.workspace.trim().is_empty(), "teams.workspace must be set");
+    assert!(
+        got.workspace.contains("/conversations/acp-temp-"),
+        "unexpected auto workspace: {}",
+        got.workspace
+    );
+
+    for agent in &got.agents {
+        let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+        assert_eq!(
+            extra.get("workspace").and_then(serde_json::Value::as_str),
+            Some(got.workspace.as_str())
+        );
+    }
 }
 
 #[tokio::test]
@@ -885,6 +1347,47 @@ async fn tc_create_team_uses_custom_agent_id_icon_lookup() {
         resp.agents[0].icon.as_deref(),
         Some("/api/assets/logos/ai-major/claude.svg")
     );
+}
+
+#[tokio::test]
+async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(StubAgentMetadataRepo::with_rows(vec![make_agent_metadata_row(
+            "2d23ff1c",
+            "claude",
+            "/api/assets/logos/ai-major/claude.svg",
+        )]));
+    let (svc, _task_manager, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    let resp = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "claude".into(),
+                    model: "claude".into(),
+                    custom_agent_id: Some("2d23ff1c".into()),
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let row = conv_repo
+        .get(&resp.agents[0].conversation_id)
+        .await
+        .unwrap()
+        .expect("lead conversation row");
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+
+    assert_eq!(extra["custom_agent_id"], serde_json::json!("2d23ff1c"));
+    assert_eq!(extra["preset_assistant_id"], serde_json::json!("2d23ff1c"));
 }
 
 #[tokio::test]
@@ -1036,7 +1539,7 @@ async fn tc3_each_agent_has_conversation_id() {
 #[tokio::test]
 async fn tl1_empty_list() {
     let svc = setup();
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     assert!(list.is_empty());
 }
 
@@ -1064,8 +1567,38 @@ async fn tl2_list_multiple_teams() {
     .await
     .unwrap();
 
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     assert_eq!(list.len(), 2);
+}
+
+#[tokio::test]
+async fn tl3_list_teams_filters_by_owner() {
+    let svc = setup();
+    svc.create_team(
+        "user1",
+        CreateTeamRequest {
+            name: "Owned".into(),
+            agents: two_agent_input(),
+            workspace: None,
+        },
+    )
+    .await
+    .unwrap();
+    svc.create_team(
+        "user2",
+        CreateTeamRequest {
+            name: "Other".into(),
+            agents: two_agent_input(),
+            workspace: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let list = svc.list_teams("user1").await.unwrap();
+
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "Owned");
 }
 
 #[tokio::test]
@@ -1099,7 +1632,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
         .unwrap();
     let before = task_manager.snapshot();
 
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     let after = task_manager.snapshot();
 
     assert_eq!(list.len(), 1);
@@ -1125,7 +1658,7 @@ async fn tg1_get_existing_team() {
         .await
         .unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.id, created.id);
     assert_eq!(got.name, "Alpha");
     assert_eq!(got.agents.len(), 2);
@@ -1134,8 +1667,28 @@ async fn tg1_get_existing_team() {
 #[tokio::test]
 async fn tg2_get_nonexistent_returns_error() {
     let svc = setup();
-    let result = svc.get_team("nonexistent").await;
+    let result = svc.get_team("user1", "nonexistent").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn tg3_get_team_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.get_team("user2", &created.id).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // -- Delete team --------------------------------------------------------------
@@ -1156,7 +1709,7 @@ async fn td1_delete_existing_team() {
         .unwrap();
 
     svc.remove_team("user1", &created.id).await.unwrap();
-    let list = svc.list_teams().await.unwrap();
+    let list = svc.list_teams("user1").await.unwrap();
     assert!(list.is_empty());
 }
 
@@ -1184,16 +1737,36 @@ async fn tr1_rename_existing_team() {
         .await
         .unwrap();
 
-    svc.rename_team(&created.id, "New Name").await.unwrap();
-    let got = svc.get_team(&created.id).await.unwrap();
+    svc.rename_team("user1", &created.id, "New Name").await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.name, "New Name");
 }
 
 #[tokio::test]
 async fn tr4_rename_nonexistent_returns_error() {
     let svc = setup();
-    let result = svc.rename_team("nonexistent", "X").await;
+    let result = svc.rename_team("user1", "nonexistent", "X").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn tr5_rename_team_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.rename_team("user2", &created.id, "Nope").await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // ===========================================================================
@@ -1241,7 +1814,7 @@ async fn aa1_add_agent_to_team() {
     assert_eq!(agent.role, "teammate");
     assert!(!agent.conversation_id.is_empty());
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.agents.len(), 2);
 }
 
@@ -1295,6 +1868,301 @@ async fn aa_add_agent_inherits_team_workspace() {
 }
 
 #[tokio::test]
+async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, team_repo, _, conv_repo) =
+        setup_with_factory_metadata_team_repo_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Legacy".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "acp".into(),
+                    model: "claude".into(),
+                    custom_agent_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let leader_workspace = conv_repo.get_extra(&created.agents[0].conversation_id).unwrap()["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    force_team_workspace(&team_repo, &created.id, "").await;
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert_eq!(got.workspace, leader_workspace);
+    let added_extra = conv_repo.get_extra(&added.conversation_id).unwrap();
+    assert_eq!(
+        added_extra.get("workspace").and_then(serde_json::Value::as_str),
+        Some(leader_workspace.as_str())
+    );
+}
+
+#[tokio::test]
+async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_unusable() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, team_repo, _, conv_repo) =
+        setup_with_factory_metadata_team_repo_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Legacy Empty".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "acp".into(),
+                    model: "claude".into(),
+                    custom_agent_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    force_team_workspace(&team_repo, &created.id, "").await;
+    conv_repo
+        .patch_extra(
+            &created.agents[0].conversation_id,
+            serde_json::json!({ "workspace": "/tmp/aionui-team-missing-leader-workspace" }),
+        )
+        .unwrap();
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(
+        got.workspace
+            .contains(&format!("/conversations/team-temp-{}", created.id)),
+        "unexpected team temp workspace: {}",
+        got.workspace
+    );
+    let added_extra = conv_repo.get_extra(&added.conversation_id).unwrap();
+    assert_eq!(
+        added_extra.get("workspace").and_then(serde_json::Value::as_str),
+        Some(got.workspace.as_str())
+    );
+}
+
+#[tokio::test]
+async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, team_repo, _, conv_repo) =
+        setup_with_factory_metadata_team_repo_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Writeback Failure".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "acp".into(),
+                    model: "claude".into(),
+                    custom_agent_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    force_team_workspace(&team_repo, &created.id, "").await;
+    team_repo.fail_workspace_update();
+    let before_count = conv_repo.conversation_count();
+
+    let err = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .expect_err("workspace writeback failure must block teammate creation");
+
+    assert!(
+        err.to_string().contains("forced workspace writeback failure"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(conv_repo.conversation_count(), before_count);
+}
+
+#[tokio::test]
+async fn add_agent_continues_when_team_temp_leader_patch_fails() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, team_repo, conversation_ports, conv_repo) =
+        setup_with_ports_team_repo_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Patch Failure".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: "acp".into(),
+                    model: "claude".into(),
+                    custom_agent_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    force_team_workspace(&team_repo, &created.id, "").await;
+    conv_repo
+        .patch_extra(
+            &created.agents[0].conversation_id,
+            serde_json::json!({ "workspace": "/tmp/aionui-team-missing-leader-workspace" }),
+        )
+        .unwrap();
+    conversation_ports
+        .fail_leader_workspace_patch
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Worker".into(),
+                role: "teammate".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    assert!(
+        got.workspace
+            .contains(&format!("/conversations/team-temp-{}", created.id))
+    );
+    let added_extra = conv_repo.get_extra(&added.conversation_id).unwrap();
+    assert_eq!(
+        added_extra.get("workspace").and_then(serde_json::Value::as_str),
+        Some(got.workspace.as_str())
+    );
+}
+
+#[tokio::test]
+async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Typed".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for agent in &created.agents {
+        let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+        assert_eq!(extra.get("teamId").and_then(|v| v.as_str()), Some(created.id.as_str()));
+        assert_eq!(
+            extra.get("slot_id").and_then(|v| v.as_str()),
+            Some(agent.slot_id.as_str())
+        );
+        assert_eq!(extra.get("role").and_then(|v| v.as_str()), Some(agent.role.as_str()));
+        assert_eq!(
+            extra.get("backend").and_then(|v| v.as_str()),
+            Some(agent.backend.as_str())
+        );
+        assert_eq!(
+            extra.get("session_mode").and_then(|v| v.as_str()),
+            Some("yolo"),
+            "Team provisioning should write the runtime seed for initial agents"
+        );
+    }
+
+    let added = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Extra".into(),
+                role: "teammate".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let extra = conv_repo.get_extra(&added.conversation_id).unwrap();
+    assert_eq!(extra.get("teamId").and_then(|v| v.as_str()), Some(created.id.as_str()));
+    assert_eq!(
+        extra.get("slot_id").and_then(|v| v.as_str()),
+        Some(added.slot_id.as_str())
+    );
+    assert_eq!(extra.get("role").and_then(|v| v.as_str()), Some(added.role.as_str()));
+    assert_eq!(
+        extra.get("backend").and_then(|v| v.as_str()),
+        Some(added.backend.as_str())
+    );
+    assert_eq!(
+        extra.get("session_mode").and_then(|v| v.as_str()),
+        Some("yolo"),
+        "Team provisioning should write the runtime seed for added agents"
+    );
+}
+
+#[tokio::test]
 async fn aa4_add_agent_to_nonexistent_team() {
     let svc = setup();
     let result = svc
@@ -1331,7 +2199,7 @@ async fn ar1_remove_agent_from_team() {
     let worker_slot = created.agents[1].slot_id.clone();
     svc.remove_agent("user1", &created.id, &worker_slot).await.unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(got.agents.len(), 1);
     assert!(got.agents.iter().all(|a| a.slot_id != worker_slot));
 }
@@ -1371,9 +2239,11 @@ async fn an1_rename_agent() {
         .unwrap();
 
     let slot_id = created.agents[1].slot_id.clone();
-    svc.rename_agent(&created.id, &slot_id, "Senior Worker").await.unwrap();
+    svc.rename_agent("user1", &created.id, &slot_id, "Senior Worker")
+        .await
+        .unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     let agent = got.agents.iter().find(|a| a.slot_id == slot_id).unwrap();
     assert_eq!(agent.name, "Senior Worker");
 }
@@ -1393,7 +2263,7 @@ async fn an3_rename_nonexistent_agent() {
         .await
         .unwrap();
 
-    let result = svc.rename_agent(&created.id, "nonexistent", "X").await;
+    let result = svc.rename_agent("user1", &created.id, "nonexistent", "X").await;
     assert!(result.is_err());
 }
 
@@ -1416,7 +2286,59 @@ async fn es1_ensure_session_creates_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn spawn_agent_in_session_rejects_without_active_team_run_before_persisting_agent() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("session should be loaded without active Team Run");
+    let lead_slot_id = created
+        .lead_agent_id
+        .clone()
+        .expect("created team should have a lead slot");
+
+    let req = SpawnAgentRequest {
+        name: "Helper".into(),
+        agent_type: Some("claude".into()),
+        custom_agent_id: None,
+        model: Some("claude-sonnet-4".into()),
+    };
+
+    let err = svc
+        .spawn_agent_in_session(&created.id, &lead_slot_id, req)
+        .await
+        .expect_err("spawn without active Team Run must fail before persistence");
+
+    assert!(matches!(
+        err,
+        TeamError::InvalidRequest(message)
+            if message == "no active team run for run-scoped wake"
+    ));
+
+    let after = svc
+        .get_team("user1", &created.id)
+        .await
+        .expect("team should still be readable");
+    assert_eq!(
+        after.agents.len(),
+        created.agents.len(),
+        "failed spawn must not persist a partial teammate"
+    );
 }
 
 #[tokio::test]
@@ -1434,32 +2356,46 @@ async fn es2_ensure_session_is_idempotent() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 }
 
 #[tokio::test]
 async fn es3_ensure_session_nonexistent_team() {
     let svc = setup();
-    let result = svc.ensure_session("nonexistent").await;
+    let result = svc.ensure_session("user1", "nonexistent").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn es4_ensure_session_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.ensure_session("user2", &created.id).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // -- W5-D31b-2: team.mcpStatus service-layer broadcasts ---------------------
 //
-// The happy-path assertion (session_injecting → session_ready) would require
-// `create_team` to succeed, but on this branch base `create_team` panics at
-// conversation creation because `StubAcpSessionRepo::create` returns Err
-// (pre-existing baseline break — same root cause `es1_ensure_session_creates_session`
-// fails with on `feat/team-wave4-5` HEAD). We therefore only assert the
-// `load_failed` broadcast end-to-end here; the remaining phase transitions
-// (SessionInjecting / SessionReady / ConfigWriteFailed / SessionError) are
-// covered by inline assertions that do not depend on `create_team`.
+// The happy-path phase transitions are covered by focused service/session
+// assertions. This test keeps the load-failed broadcast covered end-to-end.
 
 #[tokio::test]
 async fn d31b2_ensure_session_broadcasts_load_failed_for_missing_team() {
     let (svc, recorder) = setup_with_recording_broadcaster();
-    let err = svc.ensure_session("nonexistent-team-xyz").await.unwrap_err();
+    let err = svc.ensure_session("user1", "nonexistent-team-xyz").await.unwrap_err();
     assert!(matches!(err, aionui_team::TeamError::TeamNotFound(_)));
 
     let load_failed = recorder
@@ -1495,8 +2431,8 @@ async fn ss1_stop_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.stop_session(&created.id);
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.stop_session("user1", &created.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -1514,7 +2450,27 @@ async fn ss3_stop_session_without_active_is_noop() {
         .await
         .unwrap();
 
-    svc.stop_session(&created.id);
+    svc.stop_session("user1", &created.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn ss4_stop_session_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.stop_session("user2", &created.id).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 // ===========================================================================
@@ -1524,7 +2480,7 @@ async fn ss3_stop_session_without_active_is_noop() {
 #[tokio::test]
 async fn sm4_send_message_no_session_returns_error() {
     let svc = setup();
-    let result = svc.send_message("nonexistent", "Hello", None).await;
+    let result = svc.send_message("user1", "nonexistent", "Hello", None).await;
     assert!(result.is_err());
 }
 
@@ -1543,8 +2499,30 @@ async fn sm1_send_message_with_active_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.send_message(&created.id, "Hello team", None).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.send_message("user1", &created.id, "Hello team", None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sm2_send_message_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = svc.send_message("user2", &created.id, "Hello", None).await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 #[tokio::test]
@@ -1562,11 +2540,34 @@ async fn sa_send_message_to_agent_with_active_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     let worker_slot = created.agents[1].slot_id.clone();
-    svc.send_message_to_agent(&created.id, &worker_slot, "Do this", None)
+    svc.send_message_to_agent("user1", &created.id, &worker_slot, "Do this", None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn sa2_send_message_to_agent_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker_slot = created.agents[1].slot_id.clone();
+
+    let result = svc
+        .send_message_to_agent("user2", &created.id, &worker_slot, "Do this", None)
+        .await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
 }
 
 #[tokio::test]
@@ -1584,9 +2585,9 @@ async fn sa3_send_message_to_nonexistent_agent() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     let result = svc
-        .send_message_to_agent(&created.id, "nonexistent", "Hello", None)
+        .send_message_to_agent("user1", &created.id, "nonexistent", "Hello", None)
         .await;
     assert!(result.is_err());
 }
@@ -1621,8 +2622,8 @@ async fn dispose_all_cleans_up_sessions() {
         .await
         .unwrap();
 
-    svc.ensure_session(&t1.id).await.unwrap();
-    svc.ensure_session(&t2.id).await.unwrap();
+    svc.ensure_session("user1", &t1.id).await.unwrap();
+    svc.ensure_session("user1", &t2.id).await.unwrap();
 
     svc.dispose_all();
 
@@ -1650,10 +2651,10 @@ async fn td_delete_team_stops_session() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     svc.remove_team("user1", &created.id).await.unwrap();
 
-    let result = svc.send_message(&created.id, "Hello", None).await;
+    let result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(result.is_err());
 }
 
@@ -1676,8 +2677,8 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
-    svc.ensure_session(&created.id).await.unwrap();
+    reset_auto_started_session(&svc, &tm, &created.id).await;
+    svc.ensure_session("user1", &created.id).await.unwrap();
 
     // Two agents → kill called 2x and get_or_build_task called 2x, each with
     // the corresponding conversation_id. Order is agents-iteration order.
@@ -1695,23 +2696,31 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
 async fn d9_ensure_session_persists_team_mcp_stdio_config() {
     // Each agent's conversation.extra must carry a `team_mcp_stdio_config`
     // object by the time the factory is called — that is what the rebuilt
-    // ACP process will read to reach the MCP server.
+    // typed Team context will expose to reach the MCP server.
     use futures_util::FutureExt;
     let (svc, _tm) = setup_with_factory(Arc::new(|opts: BuildTaskOptions| {
         async move {
             let context = opts.context;
-            let extra_has_cfg = match &context.kind {
-                AgentSessionKind::Acp(acp) => acp
-                    .config
-                    .team_mcp_stdio_config
-                    .as_ref()
-                    .is_some_and(|cfg| cfg.port > 0 && !cfg.slot_id.is_empty()),
+            let typed_has_cfg = context
+                .team
+                .as_ref()
+                .and_then(|team| team.mcp.as_ref())
+                .is_some_and(|mcp| mcp.stdio.port > 0 && !mcp.stdio.slot_id.is_empty());
+            let compat_has_cfg = match &context.kind {
+                AgentSessionKind::Acp(acp) => {
+                    assert!(acp.belongs_to_team);
+                    assert!(acp.team.is_some(), "ACP build context must carry typed team binding");
+                    acp.config
+                        .team_mcp_stdio_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.port > 0 && !cfg.slot_id.is_empty())
+                }
                 _ => false,
             };
             assert!(
-                extra_has_cfg,
-                "factory called without team_mcp_stdio_config in typed context: {:?}",
-                context.kind
+                typed_has_cfg && compat_has_cfg,
+                "factory called without typed team_mcp_stdio_config in context: {:?}",
+                context.team
             );
             Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
                 mock_agent::MockAgent::new(context.conversation.conversation_id, context.workspace.path),
@@ -1732,7 +2741,7 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
         .await
         .unwrap();
 
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -1750,9 +2759,9 @@ async fn d9_ensure_session_is_idempotent() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
-    svc.ensure_session(&created.id).await.unwrap();
-    svc.ensure_session(&created.id).await.unwrap();
+    reset_auto_started_session(&svc, &tm, &created.id).await;
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 
     // Second call short-circuits — no additional kill/build calls.
     let calls = tm.snapshot();
@@ -1780,8 +2789,8 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
-    let result = svc.ensure_session(&created.id).await;
+    reset_auto_started_session(&svc, &tm, &created.id).await;
+    let result = svc.ensure_session("user1", &created.id).await;
     assert!(result.is_err(), "ensure_session should propagate build error");
 
     // Rebuild aborts on the first warmup failure, so only the first agent
@@ -1790,7 +2799,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
     assert_eq!(calls.kill.len(), 1);
     assert_eq!(calls.build.len(), 1);
 
-    let send_result = svc.send_message(&created.id, "Hello", None).await;
+    let send_result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(
         send_result.is_err(),
         "session must not be registered after build failure"
@@ -1871,7 +2880,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
     a.unwrap().unwrap();
     b.unwrap().unwrap();
 
-    let got = svc.get_team(&created.id).await.unwrap();
+    let got = svc.get_team("user1", &created.id).await.unwrap();
     assert_eq!(
         got.agents.len(),
         3,
@@ -1898,9 +2907,9 @@ async fn d115_remove_team_kills_every_agent_process() {
         .await
         .unwrap();
 
-    reset_auto_started_session(&svc, &tm, &created.id);
+    reset_auto_started_session(&svc, &tm, &created.id).await;
     // Bring two agents online — after ensure_session, active_count == 2.
-    svc.ensure_session(&created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
     assert_eq!(tm.active_count(), 2, "ensure_session must register 2 live agents");
 
     let before_kill = tm.snapshot().kill.len();

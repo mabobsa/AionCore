@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
-use aionui_api_types::{TeamMcpPhase, TeamMcpStatusPayload, WebSocketMessage};
+use aionui_api_types::{
+    TeamMcpPhase, TeamMcpStatusPayload, TeamSendMessageQueuedResponse, TeamSendMessageStatus, WebSocketMessage,
+};
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -9,10 +11,12 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
+use crate::events::TEAM_MCP_STATUS_EVENT;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
-use crate::session::SpawnAgentRequest;
+use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::types::{TeammateRole, TeammateStatus};
+use crate::wake::TeamWakeSource;
 
 use super::protocol::{
     INVALID_PARAMS, INVALID_REQUEST, JsonRpcResponse, METHOD_NOT_FOUND, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
@@ -151,7 +155,7 @@ impl Drop for TeamMcpServer {
 
 fn broadcast_mcp_status(broadcaster: &dyn EventBroadcaster, payload: TeamMcpStatusPayload) {
     let event = WebSocketMessage::new(
-        "team.mcpStatus",
+        TEAM_MCP_STATUS_EVENT,
         serde_json::to_value(payload).expect("serialize mcp status payload"),
     );
     broadcaster.broadcast(event);
@@ -518,6 +522,19 @@ async fn exec_send_message(
             .notify_shutdown_rejected(caller_slot_id, reason)
             .await
             .map_err(|e| e.to_string())?;
+        if let Some(svc) = service.upgrade()
+            && let Err(e) = svc
+                .wake_leader_after_recovery_message(team_id, caller_slot_id, TeamWakeSource::ShutdownRejected)
+                .await
+        {
+            warn!(
+                team_id,
+                slot_id = %caller_slot_id,
+                wake_source = %TeamWakeSource::ShutdownRejected,
+                error = %e,
+                "failed to apply shutdown_rejected wake policy"
+            );
+        }
         debug!(from = caller_slot_id, reason, "shutdown_rejected handled");
         return Ok(format!("shutdown_rejected: {reason}"));
     }
@@ -528,38 +545,52 @@ async fn exec_send_message(
         resolve_agent_target(scheduler, &input.to).await?
     };
 
-    let action = crate::scheduler::SchedulerAction::SendMessage {
-        to: resolved_to.clone(),
-        message: input.message,
-    };
-    scheduler
-        .execute_action(caller_slot_id, &action)
+    let service = service
+        .upgrade()
+        .ok_or_else(|| "Team service not available; cannot wake target".to_string())?;
+    service
+        .require_active_team_run_for_team_work(team_id)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Always notify target agent(s). If the event loop is in the drain
-    // loop (working), the notify permit will be consumed on next iteration.
-    // If idle/waiting, it wakes immediately.
-    if let Some(svc) = service.upgrade() {
-        let targets = if resolved_to == "*" {
-            scheduler
-                .list_agents()
-                .await
-                .iter()
-                .filter(|a| a.slot_id != caller_slot_id)
-                .map(|a| a.slot_id.clone())
-                .collect::<Vec<_>>()
-        } else {
-            vec![resolved_to.clone()]
-        };
-        for target in &targets {
-            if let Err(e) = svc.wake_agent_in_session(team_id, target).await {
-                debug!(team_id, target = target.as_str(), error = %e, "wake after send_message failed (non-fatal)");
-            }
-        }
+    let targets = if resolved_to == "*" {
+        scheduler
+            .list_agents()
+            .await
+            .iter()
+            .filter(|a| a.slot_id != caller_slot_id)
+            .map(|a| a.slot_id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        vec![resolved_to.clone()]
+    };
+    let mut target_results = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let result = service
+            .send_agent_message_from_agent(team_id, caller_slot_id, target, &input.message)
+            .await
+            .map_err(|e| e.to_string())?;
+        target_results.push(result);
     }
 
-    Ok(format!("Message sent to {}", input.to))
+    let response = build_send_message_queued_response(target_results)?;
+
+    serde_json::to_string(&response).map_err(|e| format!("Serialization error: {e}"))
+}
+
+fn build_send_message_queued_response(
+    target_results: Vec<AgentMessageQueueResult>,
+) -> Result<TeamSendMessageQueuedResponse, String> {
+    let first = target_results
+        .first()
+        .ok_or_else(|| "No message targets resolved".to_string())?;
+    Ok(TeamSendMessageQueuedResponse {
+        status: TeamSendMessageStatus::Queued,
+        delivery: first.delivery.clone(),
+        reason: first.target.queue_state.clone(),
+        team_run_id: first.team_run_id.clone(),
+        targets: target_results.into_iter().map(|result| result.target).collect(),
+    })
 }
 
 async fn exec_spawn_agent(
@@ -699,7 +730,11 @@ async fn exec_rename_agent(
     let resolved_slot = resolve_agent_target(scheduler, &input.slot_id).await?;
 
     if let Some(svc) = service.upgrade() {
-        svc.rename_agent(team_id, &resolved_slot, &input.new_name)
+        let user_id = svc
+            .get_session_user_id(team_id)
+            .await
+            .ok_or_else(|| format!("No active session for team {team_id}"))?;
+        svc.rename_agent(&user_id, team_id, &resolved_slot, &input.new_name)
             .await
             .map_err(|e| e.to_string())?;
     } else {
@@ -726,6 +761,14 @@ async fn exec_shutdown_agent(
     let input: ShutdownAgentInput = serde_json::from_value(args.clone()).map_err(|e| format!("Invalid params: {e}"))?;
 
     let target_slot_id = resolve_agent_target(scheduler, &input.slot_id).await?;
+    let service = service
+        .upgrade()
+        .ok_or_else(|| "Team service not available; cannot wake shutdown target".to_string())?;
+    service
+        .require_active_team_run_for_team_work(team_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
     let action = crate::scheduler::SchedulerAction::ShutdownAgent {
         slot_id: target_slot_id.clone(),
         reason: input.reason,
@@ -735,12 +778,10 @@ async fn exec_shutdown_agent(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Wake the target agent so it reads the shutdown_request from its mailbox.
-    if let Some(svc) = service.upgrade()
-        && let Err(e) = svc.wake_agent_in_session(team_id, &target_slot_id).await
-    {
-        debug!(team_id, target = %target_slot_id, error = %e, "wake after shutdown_request failed (non-fatal)");
-    }
+    service
+        .wake_agent_for_team_work(team_id, &target_slot_id, TeamWakeSource::McpShutdownRequest, None)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(format!("Shutdown request sent to agent '{}'", target_slot_id))
 }
@@ -868,6 +909,35 @@ async fn http_mcp_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::{
+        TeamRunTargetRole, TeamSendMessageDelivery, TeamSendMessageReason, TeamSendMessageTargetQueueState,
+    };
+
+    #[test]
+    fn build_send_message_queued_response_serializes_json_contract() {
+        let response = build_send_message_queued_response(vec![AgentMessageQueueResult {
+            team_run_id: "run-1".into(),
+            delivery: TeamSendMessageDelivery::WakeRecorded,
+            target: TeamSendMessageTargetQueueState {
+                slot_id: "worker-1".into(),
+                role: TeamRunTargetRole::Teammate,
+                queue_state: TeamSendMessageReason::QueuedForIdle,
+                pending_wake_count: 1,
+                starting_child_count: 0,
+                active_turn_id: None,
+                suppressed_wake_count: 0,
+            },
+        }])
+        .unwrap();
+
+        let text = serde_json::to_string(&response).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).expect("team_send_message result must be JSON");
+        assert_eq!(payload["status"], "queued");
+        assert_eq!(payload["delivery"], "wake_recorded");
+        assert_eq!(payload["reason"], "queued_for_idle");
+        assert_eq!(payload["targets"][0]["slot_id"], "worker-1");
+        assert_eq!(payload["targets"][0]["queue_state"], "queued_for_idle");
+    }
 
     /// Non-Lead callers are rejected at the dispatch layer with the
     /// "Only Lead ..." phrasing. Service weak is never upgraded because

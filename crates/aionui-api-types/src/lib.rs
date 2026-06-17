@@ -31,10 +31,11 @@ mod team_mcp;
 mod websocket;
 
 pub use acp::{
-    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AgentModeResponse, DetectCliRequest,
-    DetectCliResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest, SetModeRequest,
-    SetModelRequest, SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest,
-    TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
+    AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse,
+    AgentModeResponse, ConfigOptionConfirmation, DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse,
+    GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest, SetConfigOptionRequest,
+    SetConfigOptionResponse, SetModeRequest, SetModelRequest, SideQuestionRequest, SideQuestionResponse,
+    TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
@@ -47,8 +48,12 @@ pub use agent_error::{
     AgentStreamErrorData,
 };
 pub use assistant::{
-    AssistantResponse, AssistantSource, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult,
-    ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
+    AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
+    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
+    AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
+    AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
+    CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
+    UpdateAssistantRequest,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
@@ -64,13 +69,14 @@ pub use channel::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    ActiveCountResponse, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
-    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
+    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
+    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationResponse,
+    ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateCronJobRequest, CronAgentConfigDto, CronJobExecutedEvent, CronJobMetadataDto, CronJobPayloadDto,
@@ -102,11 +108,10 @@ pub use mcp::{
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
 pub use office::{
-    CellCoord, CellRange, ConversionResultDto, ConversionTarget, DetectStarOfficeRequest, DocumentConversionRequest,
-    DocumentConversionResponse, ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest,
-    ListSnapshotsRequest, PptJsonData, PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState,
-    PreviewStatusEvent, PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StarOfficeDetectResponse,
-    StartPreviewRequest, StopPreviewRequest,
+    CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
+    ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest, ListSnapshotsRequest, PptJsonData,
+    PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
+    PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
@@ -141,10 +146,14 @@ pub use system::{
     ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
-    AddAgentRequest, CreateTeamRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse,
-    TeamAgentShutdownPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamListResponse, TeamMcpPhase,
-    TeamMcpStatusPayload, TeamResponse, TeammateMessagePayload,
+    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,
+    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
+    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentSpawnedPayload,
+    TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMcpPhase, TeamMcpRuntimeConfig,
+    TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunStatus, TeamRunTargetRole,
+    TeamRuntimeSeed, TeamSendMessageDelivery, TeamSendMessageQueuedResponse, TeamSendMessageReason,
+    TeamSendMessageStatus, TeamSendMessageTargetQueueState, TeamSessionBinding, TeamSlotRuntimeHealth,
+    TeamSlotWorkPayload, TeammateMessagePayload,
 };
 pub use team_mcp::{GuideMcpConfig, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use websocket::WebSocketMessage;
