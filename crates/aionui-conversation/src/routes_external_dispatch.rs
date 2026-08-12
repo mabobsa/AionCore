@@ -101,18 +101,6 @@ fn map_dispatch_error(error: ExternalConversationDispatchError) -> ApiError {
             "The target conversation belongs to another user.",
             None,
         ),
-        ExternalConversationDispatchError::ResearchProfileRequired => ApiError::coded(
-            StatusCode::CONFLICT,
-            "EXTERNAL_DISPATCH_RESEARCH_PROFILE_REQUIRED",
-            "Research execution can only resume a research-profile conversation.",
-            None,
-        ),
-        ExternalConversationDispatchError::ResearchProfileCannotEdit => ApiError::coded(
-            StatusCode::CONFLICT,
-            "EXTERNAL_DISPATCH_RESEARCH_PROFILE_CANNOT_EDIT",
-            "A research-profile conversation cannot run Unity edits.",
-            None,
-        ),
         ExternalConversationDispatchError::CapacityExhausted => ApiError::coded(
             StatusCode::TOO_MANY_REQUESTS,
             "EXTERNAL_DISPATCH_CAPACITY_EXHAUSTED",

@@ -20,9 +20,8 @@ use aionui_ai_agent::{
 
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
-    ConversationResponse, ConversationRuntimeConfigSource, ExternalConversationDispatchExecutionMode,
-    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest,
-    SetConfigOptionResponse,
+    ConversationResponse, ConversationRuntimeConfigSource, GetConfigOptionsResponse, GetModelInfoResponse,
+    ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ReloadConversationMcpServersRequest,
@@ -4630,7 +4629,6 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: true,
             user_message_hidden: true,
             on_resource_waiting: None,
@@ -4659,7 +4657,6 @@ async fn run_agent_turn_broadcasts_visible_user_message_and_list_change() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: true,
             user_message_hidden: false,
             on_resource_waiting: None,
@@ -4733,7 +4730,6 @@ async fn run_agent_turn_waits_for_another_turn_using_the_same_unity_project() {
                 files: Vec::new(),
                 inject_skills: Vec::new(),
                 required_runtime_mode: None,
-                execution_mode: ExternalConversationDispatchExecutionMode::UnityEdit,
                 persist_user_message: true,
                 user_message_hidden: false,
                 on_resource_waiting: Some(Arc::new(move |event| {
@@ -4813,7 +4809,6 @@ async fn run_agent_turn_can_be_cancelled_while_waiting_for_the_unity_project() {
                 files: Vec::new(),
                 inject_skills: Vec::new(),
                 required_runtime_mode: None,
-                execution_mode: ExternalConversationDispatchExecutionMode::UnityEdit,
                 persist_user_message: true,
                 user_message_hidden: false,
                 on_resource_waiting: Some(Arc::new(move |event| {
@@ -4853,201 +4848,6 @@ async fn run_agent_turn_can_be_cancelled_while_waiting_for_the_unity_project() {
 }
 
 #[tokio::test]
-async fn research_turn_bypasses_unity_lock_and_forces_codex_read_only_mode() {
-    let task_mgr = Arc::new(MockTaskManager::new());
-    let (service, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
-    let conv = service
-        .create("user_1", make_create_req_with_backend("codex"))
-        .await
-        .unwrap();
-    let unity_project = tempfile::tempdir().unwrap();
-    std::fs::create_dir(unity_project.path().join("Assets")).unwrap();
-    std::fs::create_dir(unity_project.path().join("ProjectSettings")).unwrap();
-    std::fs::write(
-        unity_project.path().join("ProjectSettings/ProjectVersion.txt"),
-        "m_EditorVersion: 2022.3",
-    )
-    .unwrap();
-    {
-        let mut rows = repo.rows.lock().unwrap();
-        let row = rows.iter_mut().find(|row| row.id == conv.id).unwrap();
-        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
-        extra["workspace"] = json!(unity_project.path());
-        extra["external_execution_profile"] = json!("research");
-        extra["mcp_servers"] = json!(["MindNProgress"]);
-        row.extra = extra.to_string();
-    }
-    let lock_holder_extra = json!({
-        "workspace": unity_project.path(),
-        "mcp_servers": ["unityMCP"]
-    })
-    .to_string();
-    let unity_permit = service
-        .unity_turn_coordinator()
-        .claim_for_conversation_extra(&lock_holder_extra)
-        .unwrap()
-        .try_acquire()
-        .ok()
-        .expect("Unity edit permit");
-    let agent = Arc::new(MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
-        id: "mode".to_owned(),
-        name: Some("Mode".to_owned()),
-        label: None,
-        description: None,
-        category: Some("mode".to_owned()),
-        option_type: "select".to_owned(),
-        current_value: Some("full-access".to_owned()),
-        options: Vec::new(),
-    }]));
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
-
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(1),
-        service.run_agent_turn(ConversationAgentTurnRequest {
-            user_id: "user_1".into(),
-            conversation_id: conv.id,
-            content: "inspect the Unity project without editing".into(),
-            files: Vec::new(),
-            inject_skills: Vec::new(),
-            required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::Research,
-            persist_user_message: true,
-            user_message_hidden: false,
-            on_resource_waiting: None,
-            on_started: None,
-        }),
-    )
-    .await
-    .expect("research turn must not wait for the Unity edit lock")
-    .unwrap();
-
-    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
-    assert_eq!(
-        agent.set_config_option_calls.lock().unwrap().as_slice(),
-        &[("mode".to_owned(), "read-only".to_owned())]
-    );
-    drop(unity_permit);
-}
-
-#[tokio::test]
-async fn research_turn_fails_closed_when_unity_mcp_is_present() {
-    let (service, _broadcaster, repo, _task_mgr) = make_service();
-    let conv = service
-        .create("user_1", make_create_req_with_backend("codex"))
-        .await
-        .unwrap();
-    {
-        let mut rows = repo.rows.lock().unwrap();
-        let row = rows.iter_mut().find(|row| row.id == conv.id).unwrap();
-        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
-        extra["external_execution_profile"] = json!("research");
-        extra["mcp_servers"] = json!(["unityMCP"]);
-        row.extra = extra.to_string();
-    }
-
-    let outcome = service
-        .run_agent_turn(ConversationAgentTurnRequest {
-            user_id: "user_1".into(),
-            conversation_id: conv.id,
-            content: "inspect only".into(),
-            files: Vec::new(),
-            inject_skills: Vec::new(),
-            required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::Research,
-            persist_user_message: true,
-            user_message_hidden: false,
-            on_resource_waiting: None,
-            on_started: None,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
-    assert_eq!(
-        outcome.error_message.as_deref(),
-        Some("Research execution cannot use UnityMCP")
-    );
-}
-
-#[tokio::test]
-async fn research_turn_fails_when_read_only_mode_is_not_observed() {
-    let task_mgr = Arc::new(MockTaskManager::new());
-    let (service, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
-    let conv = service
-        .create("user_1", make_create_req_with_backend("codex"))
-        .await
-        .unwrap();
-    {
-        let mut rows = repo.rows.lock().unwrap();
-        let row = rows.iter_mut().find(|row| row.id == conv.id).unwrap();
-        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
-        extra["external_execution_profile"] = json!("research");
-        row.extra = extra.to_string();
-    }
-    let agent = Arc::new(
-        MockAgent::new(&conv.id).with_set_config_option_response(SetConfigOptionResponse {
-            confirmation: ConfigOptionConfirmation::CommandAck,
-            config_options: None,
-        }),
-    );
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
-
-    let outcome = service
-        .run_agent_turn(ConversationAgentTurnRequest {
-            user_id: "user_1".into(),
-            conversation_id: conv.id,
-            content: "inspect only".into(),
-            files: Vec::new(),
-            inject_skills: Vec::new(),
-            required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::Research,
-            persist_user_message: true,
-            user_message_hidden: false,
-            on_resource_waiting: None,
-            on_started: None,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
-    assert!(
-        outcome
-            .error_message
-            .as_deref()
-            .is_some_and(|message| message.contains("was not observed"))
-    );
-}
-
-#[tokio::test]
-async fn unity_edit_turn_fails_without_unity_mcp_and_valid_project() {
-    let (service, _broadcaster, _repo, _task_mgr) = make_service();
-    let conv = service.create("user_1", make_create_req()).await.unwrap();
-
-    let outcome = service
-        .run_agent_turn(ConversationAgentTurnRequest {
-            user_id: "user_1".into(),
-            conversation_id: conv.id,
-            content: "edit the Unity project".into(),
-            files: Vec::new(),
-            inject_skills: Vec::new(),
-            required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::UnityEdit,
-            persist_user_message: true,
-            user_message_hidden: false,
-            on_resource_waiting: None,
-            on_started: None,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
-    assert_eq!(
-        outcome.error_message.as_deref(),
-        Some("Unity edit execution requires UnityMCP and a valid Unity project workspace")
-    );
-}
-
-#[tokio::test]
 async fn run_agent_turn_does_not_broadcast_visible_events_for_hidden_message() {
     let (service, broadcaster, _repo, _task_mgr) = make_service();
     let conv = service.create("user_1", make_create_req()).await.unwrap();
@@ -5061,7 +4861,6 @@ async fn run_agent_turn_does_not_broadcast_visible_events_for_hidden_message() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: true,
             user_message_hidden: true,
             on_resource_waiting: None,
@@ -5808,7 +5607,6 @@ async fn run_agent_turn_applies_required_runtime_mode_after_stream_subscription(
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: Some("yolo".to_owned()),
-            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: true,
             user_message_hidden: true,
             on_resource_waiting: None,
@@ -6777,7 +6575,6 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
-            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: true,
             user_message_hidden: true,
             on_resource_waiting: None,
@@ -9900,7 +9697,6 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: Some("default".to_owned()),
-            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: true,
             user_message_hidden: true,
             on_resource_waiting: None,

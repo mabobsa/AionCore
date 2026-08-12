@@ -120,9 +120,9 @@ pub use extension::{
     InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 pub use external_conversation_dispatch::{
-    ExternalConversationDispatchCreateOptions, ExternalConversationDispatchExecutionMode,
-    ExternalConversationDispatchRequest, ExternalConversationDispatchResource, ExternalConversationDispatchResponse,
-    ExternalConversationDispatchState, ExternalConversationDispatchStrategy,
+    ExternalConversationDispatchCreateOptions, ExternalConversationDispatchRequest,
+    ExternalConversationDispatchResource, ExternalConversationDispatchResponse, ExternalConversationDispatchState,
+    ExternalConversationDispatchStrategy,
 };
 pub use external_conversation_launch::{
     ClaimExternalConversationLaunchRequest, ClaimExternalConversationLaunchResponse,

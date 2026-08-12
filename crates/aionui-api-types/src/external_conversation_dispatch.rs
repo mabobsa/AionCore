@@ -7,15 +7,6 @@ pub enum ExternalConversationDispatchStrategy {
     New,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ExternalConversationDispatchExecutionMode {
-    #[default]
-    Auto,
-    Research,
-    UnityEdit,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalConversationDispatchCreateOptions {
@@ -44,8 +35,6 @@ pub struct ExternalConversationDispatchRequest {
     pub operation_id: String,
     pub actor_conversation_id: String,
     pub strategy: ExternalConversationDispatchStrategy,
-    #[serde(default)]
-    pub execution_mode: ExternalConversationDispatchExecutionMode,
     #[serde(default)]
     pub target_conversation_id: Option<String>,
     pub instruction: String,
@@ -76,7 +65,6 @@ pub struct ExternalConversationDispatchResource {
 pub struct ExternalConversationDispatchResponse {
     pub operation_id: String,
     pub conversation_id: String,
-    pub execution_mode: ExternalConversationDispatchExecutionMode,
     pub state: ExternalConversationDispatchState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -104,27 +92,7 @@ mod tests {
 
         assert_eq!(request.operation_id, "operation-1");
         assert_eq!(request.strategy, ExternalConversationDispatchStrategy::Resume);
-        assert_eq!(request.execution_mode, ExternalConversationDispatchExecutionMode::Auto);
         assert_eq!(request.target_conversation_id.as_deref(), Some("target-1"));
-    }
-
-    #[test]
-    fn request_accepts_explicit_execution_modes() {
-        for (wire_value, expected) in [
-            ("research", ExternalConversationDispatchExecutionMode::Research),
-            ("unity-edit", ExternalConversationDispatchExecutionMode::UnityEdit),
-        ] {
-            let request: ExternalConversationDispatchRequest = serde_json::from_value(serde_json::json!({
-                "operationId": "operation-1",
-                "actorConversationId": "actor-1",
-                "strategy": "resume",
-                "executionMode": wire_value,
-                "targetConversationId": "target-1",
-                "instruction": "Continue the work"
-            }))
-            .unwrap();
-            assert_eq!(request.execution_mode, expected);
-        }
     }
 
     #[test]
@@ -132,7 +100,6 @@ mod tests {
         let value = serde_json::to_value(ExternalConversationDispatchResponse {
             operation_id: "operation-1".to_owned(),
             conversation_id: "target-1".to_owned(),
-            execution_mode: ExternalConversationDispatchExecutionMode::Research,
             state: ExternalConversationDispatchState::Starting,
             turn_id: None,
             error_message: None,
@@ -143,7 +110,6 @@ mod tests {
 
         assert_eq!(value["operationId"], "operation-1");
         assert_eq!(value["state"], "starting");
-        assert_eq!(value["executionMode"], "research");
         assert!(value.get("turnId").is_none());
         assert!(value.get("errorMessage").is_none());
     }
@@ -153,7 +119,6 @@ mod tests {
         let value = serde_json::to_value(ExternalConversationDispatchResponse {
             operation_id: "operation-2".to_owned(),
             conversation_id: "target-2".to_owned(),
-            execution_mode: ExternalConversationDispatchExecutionMode::UnityEdit,
             state: ExternalConversationDispatchState::WaitingResource,
             turn_id: Some("turn-2".to_owned()),
             error_message: None,

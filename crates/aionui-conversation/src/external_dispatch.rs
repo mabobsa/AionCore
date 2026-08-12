@@ -6,17 +6,14 @@ use std::time::{Duration, Instant};
 
 use aionui_api_types::{
     AssistantConversationOverridesRequest, AssistantConversationRequest, CreateConversationRequest,
-    ExternalConversationDispatchCreateOptions, ExternalConversationDispatchExecutionMode,
-    ExternalConversationDispatchRequest, ExternalConversationDispatchResource, ExternalConversationDispatchResponse,
-    ExternalConversationDispatchState, ExternalConversationDispatchStrategy,
+    ExternalConversationDispatchCreateOptions, ExternalConversationDispatchRequest,
+    ExternalConversationDispatchResource, ExternalConversationDispatchResponse, ExternalConversationDispatchState,
+    ExternalConversationDispatchStrategy,
 };
 use serde_json::{Value, json};
 
 use crate::error::ConversationError;
-use crate::service::{
-    ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService, EXTERNAL_EXECUTION_PROFILE_KEY,
-    EXTERNAL_EXECUTION_PROFILE_RESEARCH,
-};
+use crate::service::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService};
 
 const MAX_OPERATION_ID_CHARS: usize = 128;
 const MAX_CONVERSATION_ID_CHARS: usize = 120;
@@ -42,10 +39,6 @@ pub enum ExternalConversationDispatchError {
     TargetNotFound,
     #[error("external conversation dispatch target belongs to another user")]
     Forbidden,
-    #[error("research execution requires a research-profile conversation")]
-    ResearchProfileRequired,
-    #[error("a research-profile conversation cannot run Unity edits")]
-    ResearchProfileCannotEdit,
     #[error("too many external conversation dispatches are tracked")]
     CapacityExhausted,
     #[error(transparent)]
@@ -131,7 +124,6 @@ impl ExternalConversationDispatchService {
         let response = ExternalConversationDispatchResponse {
             operation_id: request.operation_id.clone(),
             conversation_id: conversation_id.clone(),
-            execution_mode: request.execution_mode,
             state: ExternalConversationDispatchState::Starting,
             turn_id: None,
             error_message: None,
@@ -157,7 +149,6 @@ impl ExternalConversationDispatchService {
                     files: Vec::new(),
                     inject_skills: Vec::new(),
                     required_runtime_mode: None,
-                    execution_mode: request.execution_mode,
                     persist_user_message: true,
                     user_message_hidden: false,
                     on_resource_waiting: Some(Arc::new(move |waiting| {
@@ -251,11 +242,6 @@ impl ExternalConversationDispatchService {
                 self.conversation_service
                     .validate_external_dispatch_target(&user_id, target_id)
                     .await?;
-                let profile = self
-                    .conversation_service
-                    .external_dispatch_execution_profile(&user_id, target_id)
-                    .await?;
-                validate_execution_profile(profile, request.execution_mode)?;
                 target_id.to_owned()
             }
             ExternalConversationDispatchStrategy::New => {
@@ -265,7 +251,7 @@ impl ExternalConversationDispatchService {
                     .ok_or(ExternalConversationDispatchError::InvalidPayload)?;
                 let conversation = self
                     .conversation_service
-                    .create(&user_id, create_conversation_request(create, request.execution_mode))
+                    .create(&user_id, create_conversation_request(create))
                     .await?;
                 conversation.id
             }
@@ -298,10 +284,7 @@ impl ExternalConversationDispatchService {
     }
 }
 
-fn create_conversation_request(
-    options: &ExternalConversationDispatchCreateOptions,
-    execution_mode: ExternalConversationDispatchExecutionMode,
-) -> CreateConversationRequest {
+fn create_conversation_request(options: &ExternalConversationDispatchCreateOptions) -> CreateConversationRequest {
     let mcp_ids = options.mcp_ids.clone();
     let mut extra = json!({
         "custom_workspace": options.workspace.is_some(),
@@ -309,9 +292,6 @@ fn create_conversation_request(
     });
     if let Some(workspace) = options.workspace.as_ref() {
         extra["workspace"] = Value::String(workspace.clone());
-    }
-    if execution_mode == ExternalConversationDispatchExecutionMode::Research {
-        extra[EXTERNAL_EXECUTION_PROFILE_KEY] = Value::String(EXTERNAL_EXECUTION_PROFILE_RESEARCH.to_owned());
     }
 
     CreateConversationRequest {
@@ -371,22 +351,6 @@ fn validate_request(request: &ExternalConversationDispatchRequest) -> Result<(),
     Ok(())
 }
 
-fn validate_execution_profile(
-    profile: Option<ExternalConversationDispatchExecutionMode>,
-    requested: ExternalConversationDispatchExecutionMode,
-) -> Result<(), ExternalConversationDispatchError> {
-    match (profile, requested) {
-        (
-            Some(ExternalConversationDispatchExecutionMode::Research),
-            ExternalConversationDispatchExecutionMode::UnityEdit,
-        ) => Err(ExternalConversationDispatchError::ResearchProfileCannotEdit),
-        (None, ExternalConversationDispatchExecutionMode::Research) => {
-            Err(ExternalConversationDispatchError::ResearchProfileRequired)
-        }
-        _ => Ok(()),
-    }
-}
-
 fn validate_create_options(
     options: &ExternalConversationDispatchCreateOptions,
 ) -> Result<(), ExternalConversationDispatchError> {
@@ -444,7 +408,6 @@ mod tests {
             operation_id: "operation-1".to_owned(),
             actor_conversation_id: "actor-1".to_owned(),
             strategy,
-            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             target_conversation_id: Some("target-1".to_owned()),
             instruction: "Continue the card work".to_owned(),
             create: None,
@@ -503,7 +466,7 @@ mod tests {
             mcp_ids: Some(vec!["mcp-a".to_owned()]),
             workspace: Some("D:/workspace".to_owned()),
         };
-        let request = create_conversation_request(&options, ExternalConversationDispatchExecutionMode::Research);
+        let request = create_conversation_request(&options);
         let assistant = request.assistant.unwrap();
         assert_eq!(assistant.id, "bare:agent-codex");
         assert_eq!(
@@ -511,10 +474,6 @@ mod tests {
             Some("gpt-5.6-sol")
         );
         assert_eq!(request.extra["workspace"], "D:/workspace");
-        assert_eq!(
-            request.extra[EXTERNAL_EXECUTION_PROFILE_KEY],
-            EXTERNAL_EXECUTION_PROFILE_RESEARCH
-        );
     }
 
     #[test]
@@ -535,27 +494,5 @@ mod tests {
             validate_request(&valid),
             Err(ExternalConversationDispatchError::InvalidPayload)
         ));
-    }
-
-    #[test]
-    fn resume_execution_mode_must_match_the_persisted_profile() {
-        assert!(matches!(
-            validate_execution_profile(None, ExternalConversationDispatchExecutionMode::Research),
-            Err(ExternalConversationDispatchError::ResearchProfileRequired)
-        ));
-        assert!(matches!(
-            validate_execution_profile(
-                Some(ExternalConversationDispatchExecutionMode::Research),
-                ExternalConversationDispatchExecutionMode::UnityEdit,
-            ),
-            Err(ExternalConversationDispatchError::ResearchProfileCannotEdit)
-        ));
-        assert!(
-            validate_execution_profile(
-                Some(ExternalConversationDispatchExecutionMode::Research),
-                ExternalConversationDispatchExecutionMode::Research,
-            )
-            .is_ok()
-        );
     }
 }
