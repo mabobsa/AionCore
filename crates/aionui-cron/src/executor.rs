@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
+use aionui_api_types::{
+    AssistantConversationRequest, CreateConversationRequest, ExternalConversationDispatchExecutionMode,
+};
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
@@ -767,6 +769,7 @@ impl JobExecutor {
             files: vec![],
             inject_skills: skill_names.clone(),
             required_runtime_mode: cron_job_runtime_mode(job).map(ToOwned::to_owned),
+            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: true,
             user_message_hidden: true,
             on_resource_waiting: None,

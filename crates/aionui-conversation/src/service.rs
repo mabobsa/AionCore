@@ -17,6 +17,7 @@ use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::ChatFileRef;
+use aionui_api_types::ExternalConversationDispatchExecutionMode;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
@@ -71,6 +72,8 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+pub(crate) const EXTERNAL_EXECUTION_PROFILE_KEY: &str = "external_execution_profile";
+pub(crate) const EXTERNAL_EXECUTION_PROFILE_RESEARCH: &str = "research";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -359,6 +362,7 @@ pub struct ConversationAgentTurnRequest {
     pub files: Vec<String>,
     pub inject_skills: Vec<String>,
     pub required_runtime_mode: Option<String>,
+    pub execution_mode: ExternalConversationDispatchExecutionMode,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
     pub on_resource_waiting: Option<ConversationAgentTurnResourceWaitingCallback>,
@@ -434,6 +438,21 @@ impl ConversationService {
             });
         }
         reject_deprecated_runtime_row(&row)
+    }
+
+    pub(crate) async fn external_dispatch_execution_profile(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ExternalConversationDispatchExecutionMode>, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        Ok(external_execution_profile_from_extra(&row.extra))
     }
 
     pub fn new(
@@ -3951,6 +3970,8 @@ impl ConversationService {
         let user_msg_id_ret = user_msg_id.clone();
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
             user_id: user_id.to_owned(),
+            execution_mode: external_execution_profile_from_extra(&row.extra)
+                .unwrap_or(ExternalConversationDispatchExecutionMode::Auto),
             conversation: row,
             content: resolved.content,
             files: resolved.files,
@@ -3999,6 +4020,33 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+
+        let persisted_profile = external_execution_profile_from_extra(&row.extra);
+        let execution_mode = match (persisted_profile, request.execution_mode) {
+            (
+                Some(ExternalConversationDispatchExecutionMode::Research),
+                ExternalConversationDispatchExecutionMode::Auto,
+            )
+            | (
+                Some(ExternalConversationDispatchExecutionMode::Research),
+                ExternalConversationDispatchExecutionMode::Research,
+            ) => ExternalConversationDispatchExecutionMode::Research,
+            (
+                Some(ExternalConversationDispatchExecutionMode::Research),
+                ExternalConversationDispatchExecutionMode::UnityEdit,
+            ) => {
+                return Err(ConversationError::BadRequest {
+                    reason: "A research-profile conversation cannot run Unity edits".into(),
+                });
+            }
+            (None, ExternalConversationDispatchExecutionMode::Research) => {
+                return Err(ConversationError::BadRequest {
+                    reason: "Research execution requires a research-profile conversation".into(),
+                });
+            }
+            (None, mode) => mode,
+            (Some(_), mode) => mode,
+        };
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
@@ -4083,6 +4131,7 @@ impl ConversationService {
         let result = ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone())
             .run_user_turn(TurnStartInput {
                 user_id: request.user_id,
+                execution_mode,
                 conversation: row,
                 content: request.content,
                 files: request.files,
@@ -5002,6 +5051,17 @@ fn strip_request_fork_spec(extra: &mut serde_json::Value) {
 
 fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
+}
+
+fn external_execution_profile_from_extra(extra: &str) -> Option<ExternalConversationDispatchExecutionMode> {
+    let extra: serde_json::Value = serde_json::from_str(extra).ok()?;
+    match extra
+        .get(EXTERNAL_EXECUTION_PROFILE_KEY)
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(EXTERNAL_EXECUTION_PROFILE_RESEARCH) => Some(ExternalConversationDispatchExecutionMode::Research),
+        _ => None,
+    }
 }
 
 fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError> {

@@ -82,6 +82,10 @@ fn unity_turn_resource_from_extra(extra: &str) -> Option<UnityTurnResource> {
     Some(UnityTurnResource { key, project_root })
 }
 
+pub(crate) fn conversation_extra_has_unity_mcp(extra: &str) -> bool {
+    serde_json::from_str(extra).ok().as_ref().is_some_and(has_unity_mcp)
+}
+
 fn has_unity_mcp(extra: &Value) -> bool {
     let matches_name = |name: &str| {
         let normalized = name

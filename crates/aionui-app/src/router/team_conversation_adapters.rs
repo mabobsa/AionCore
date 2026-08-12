@@ -5,6 +5,7 @@ use aionui_api_types::{
     AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse, McpRuntimeSnapshot,
     SetConfigOptionRequest, SetConfigOptionResponse, TeamMcpSelection,
 };
+use aionui_api_types::ExternalConversationDispatchExecutionMode;
 use aionui_common::AgentType;
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
@@ -103,6 +104,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                     files: request.files.clone(),
                     inject_skills: Vec::new(),
                     required_runtime_mode: None,
+                    execution_mode: ExternalConversationDispatchExecutionMode::Auto,
                     persist_user_message: false,
                     user_message_hidden: false,
                     on_resource_waiting: None,

@@ -6,7 +6,7 @@ use aionui_ai_agent::{
     protocol::events::{FinishEventData, ToolCallEventData, ToolCallStatus},
     types::{BuildTaskOptions, SendMessageData},
 };
-use aionui_api_types::AgentModeResponse;
+use aionui_api_types::{AgentModeResponse, ExternalConversationDispatchExecutionMode};
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs, now_ms};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService,
@@ -400,6 +400,7 @@ async fn run_agent_turn_with_empty_call_id_tool_call_is_not_persisted() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
+            execution_mode: ExternalConversationDispatchExecutionMode::Auto,
             persist_user_message: false,
             user_message_hidden: false,
             on_resource_waiting: None,

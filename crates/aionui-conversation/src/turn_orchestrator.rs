@@ -19,7 +19,8 @@ use crate::service::{
 use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
-use aionui_api_types::AgentErrorCode;
+use crate::unity_turn_coordinator::conversation_extra_has_unity_mcp;
+use aionui_api_types::{AgentErrorCode, ConfigOptionConfirmation, ExternalConversationDispatchExecutionMode};
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
@@ -29,8 +30,17 @@ fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     }
 }
 
+fn research_runtime_mode_for_backend(backend: Option<&str>) -> Option<&'static str> {
+    match backend {
+        Some("codex") => Some("read-only"),
+        Some("claude") => Some("plan"),
+        _ => None,
+    }
+}
+
 pub(crate) struct TurnStartInput {
     pub user_id: String,
+    pub execution_mode: ExternalConversationDispatchExecutionMode,
     pub conversation: ConversationRow,
     /// User message content, already resolved to the inlined `[[AION_FILES]]`
     /// form (HTTP path resolves `ChatFileRef`s; internal agent turns pass a
@@ -74,6 +84,7 @@ struct TurnAttemptInput {
     msg_id: String,
     allowed_skill_names: Vec<String>,
     required_runtime_mode: Option<String>,
+    strict_runtime_mode: bool,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
     /// Shared by every attempt of this turn — see the field's use in run_attempt.
@@ -309,7 +320,22 @@ impl ConversationTurnOrchestrator {
                 .map(str::trim)
                 .filter(|mode| !mode.is_empty())
             {
-                match apply_required_runtime_mode(&agent, backend.as_deref(), mode).await {
+                let mode_application = if input.strict_runtime_mode {
+                    match agent.set_config_option("mode", mode).await {
+                        Ok(response) if response.confirmation == ConfigOptionConfirmation::Observed => {
+                            Ok(RequiredFullAutoApplication::Applied {
+                                effective: mode.to_owned(),
+                            })
+                        }
+                        Ok(_) => Err(AgentError::conflict(format!(
+                            "Research runtime mode '{mode}' was not observed"
+                        ))),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    apply_required_runtime_mode(&agent, backend.as_deref(), mode).await
+                };
+                match mode_application {
                     Ok(RequiredFullAutoApplication::Applied { effective }) => {
                         info!(
                             conversation_id = %input.conv_id,
@@ -328,6 +354,21 @@ impl ConversationTurnOrchestrator {
                         }
                     }
                     Ok(RequiredFullAutoApplication::Skipped { resolved }) => {
+                        if input.strict_runtime_mode {
+                            let failure_message =
+                                format!("Required research runtime mode '{resolved}' is unavailable for this agent");
+                            error!(
+                                conversation_id = %input.conv_id,
+                                turn_id = %input.turn_id,
+                                mode,
+                                resolved = %resolved,
+                                "Failed closed because the research runtime mode is unavailable"
+                            );
+                            return Err(ConversationTurnResult {
+                                status: ConversationTurnStatus::Failed,
+                                error_message: Some(failure_message),
+                            });
+                        }
                         // look-before-leap: the resolved native YOLO is not
                         // selectable on this backend. The sunk method already
                         // logged a warn with backend/conversation_id/resolved;
@@ -481,12 +522,66 @@ impl ConversationTurnOrchestrator {
         let mut final_error_message;
         let mut auth_failure = false;
 
-        let mut turn_resource = None;
-        let unity_permit = if let Some(claim) = self
+        let (required_runtime_mode, strict_runtime_mode) =
+            if input.execution_mode == ExternalConversationDispatchExecutionMode::Research {
+                let mode = research_runtime_mode_for_backend(acp_backend_from_build_options(&input.build_options))
+                    .map(str::to_owned);
+                (mode, true)
+            } else {
+                (input.required_runtime_mode.clone(), false)
+            };
+
+        let unity_mcp_selected = conversation_extra_has_unity_mcp(&input.conversation.extra);
+        let unity_claim = self
             .service
             .unity_turn_coordinator()
-            .claim_for_conversation_extra(&input.conversation.extra)
-        {
+            .claim_for_conversation_extra(&input.conversation.extra);
+        let execution_configuration_error = match input.execution_mode {
+            ExternalConversationDispatchExecutionMode::Research if unity_mcp_selected => {
+                Some("Research execution cannot use UnityMCP".to_owned())
+            }
+            ExternalConversationDispatchExecutionMode::Research if required_runtime_mode.is_none() => {
+                Some("Research execution is only supported for Claude and Codex agents".to_owned())
+            }
+            ExternalConversationDispatchExecutionMode::UnityEdit if unity_claim.is_none() => {
+                Some("Unity edit execution requires UnityMCP and a valid Unity project workspace".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(error_message) = execution_configuration_error {
+            error!(
+                conversation_id = %conv_id,
+                turn_id = %turn_id,
+                execution_mode = ?input.execution_mode,
+                error = %error_message,
+                "Rejected conversation turn before agent start"
+            );
+            let was_deleting = turn_claim.release_for_turn(&turn_id);
+            self.service
+                .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
+                .await;
+            return ConversationTurnResult {
+                status: ConversationTurnStatus::Failed,
+                error_message: Some(error_message),
+            };
+        }
+
+        if input.execution_mode == ExternalConversationDispatchExecutionMode::Research {
+            info!(
+                conversation_id = %conv_id,
+                turn_id = %turn_id,
+                runtime_mode = required_runtime_mode.as_deref().unwrap_or("unavailable"),
+                "Research turn bypassing Unity project coordination"
+            );
+        }
+
+        let mut turn_resource = None;
+        let unity_permit = if let Some(claim) = match input.execution_mode {
+            ExternalConversationDispatchExecutionMode::Research => None,
+            ExternalConversationDispatchExecutionMode::Auto | ExternalConversationDispatchExecutionMode::UnityEdit => {
+                unity_claim
+            }
+        } {
             let resource = ConversationAgentTurnResource {
                 key: claim.resource().key.clone(),
                 project_root: claim.resource().project_root.clone(),
@@ -581,7 +676,8 @@ impl ConversationTurnOrchestrator {
                     send: initial_send.clone(),
                     msg_id: first_turn_msg_id.clone(),
                     allowed_skill_names: allowed_skill_names.clone(),
-                    required_runtime_mode: input.required_runtime_mode.clone(),
+                    required_runtime_mode: required_runtime_mode.clone(),
+                    strict_runtime_mode,
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
                     superseding_tips: superseding_tips.clone(),
@@ -961,6 +1057,13 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn research_mode_uses_backend_native_read_only_modes() {
+        assert_eq!(research_runtime_mode_for_backend(Some("codex")), Some("read-only"));
+        assert_eq!(research_runtime_mode_for_backend(Some("claude")), Some("plan"));
+        assert_eq!(research_runtime_mode_for_backend(Some("other")), None);
     }
 
     fn error_outcome(code: AgentErrorCode) -> RelayOutcome {
