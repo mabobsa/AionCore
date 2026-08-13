@@ -29,7 +29,6 @@ pub mod task_options;
 mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;
-mod unity_turn_coordinator;
 
 pub use error::ConversationError;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
