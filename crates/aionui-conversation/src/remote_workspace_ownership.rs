@@ -67,12 +67,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_str().unwrap();
         let expected = lease(root);
-        assert!(validate_session(&expected, Some("conversation-1"), false).await.is_err());
+        assert!(
+            validate_session(&expected, Some("conversation-1"), false)
+                .await
+                .is_err()
+        );
         let session = serde_json::json!({
             "workspaceId": "fork1", "jobId": "job-1", "leaseId": "lease-1",
             "projectRoot": root, "conversationId": "conversation-1", "ownership": expected.ownership.clone(),
         });
-        tokio::fs::write(directory.path().join(".ai-session.json"), session.to_string()).await.unwrap();
+        tokio::fs::write(directory.path().join(".ai-session.json"), session.to_string())
+            .await
+            .unwrap();
         assert!(validate_session(&expected, Some("conversation-1"), false).await.is_ok());
         assert!(validate_session(&expected, Some("other"), false).await.is_err());
         let mut stale = expected.clone();
@@ -89,9 +95,15 @@ mod tests {
             "workspaceId": "fork1", "jobId": "job-1", "leaseId": "lease-1",
             "projectRoot": root, "conversationId": "", "ownership": expected.ownership.clone(),
         });
-        tokio::fs::write(directory.path().join(".ai-session.json"), session.to_string()).await.unwrap();
+        tokio::fs::write(directory.path().join(".ai-session.json"), session.to_string())
+            .await
+            .unwrap();
         assert!(validate_session(&expected, None, true).await.is_ok());
-        assert!(validate_session(&expected, Some("conversation-1"), false).await.is_err());
+        assert!(
+            validate_session(&expected, Some("conversation-1"), false)
+                .await
+                .is_err()
+        );
         expected.ownership = None;
         assert!(validate_session(&expected, None, false).await.is_ok());
     }
