@@ -228,19 +228,18 @@ impl ExternalConversationDispatchService {
         let remote_lease = request.workspace_lease.clone();
         tokio::spawn(async move {
             let started_suppressed_choice_notice_turn = suppressed_choice_notice_turn.clone();
-            if let Some(lease) = &remote_lease {
-                if crate::remote_workspace_ownership::validate_session(lease, Some(&conversation_id), allow_unbound)
+            if let Some(lease) = &remote_lease
+                && crate::remote_workspace_ownership::validate_session(lease, Some(&conversation_id), allow_unbound)
                     .await
                     .is_err()
-                {
-                    service
-                        .update_response(&operation_id, |response| {
-                            response.state = ExternalConversationDispatchState::RecoveryRequired;
-                            response.error_message = Some("Remote workspace ownership changed before execution".to_owned());
-                        })
-                        .await;
-                    return;
-                }
+            {
+                service
+                    .update_response(&operation_id, |response| {
+                        response.state = ExternalConversationDispatchState::RecoveryRequired;
+                        response.error_message = Some("Remote workspace ownership changed before execution".to_owned());
+                    })
+                    .await;
+                return;
             }
             let started_service = service.clone();
             let started_operation_id = operation_id.clone();
@@ -883,14 +882,13 @@ fn validate_workspace_lease(
     {
         return Err(ExternalConversationDispatchError::InvalidPayload);
     }
-    if let Some(owner) = &workspace.ownership {
-        if owner.generation == 0
+    if let Some(owner) = &workspace.ownership
+        && (owner.generation == 0
             || [&owner.coordinator_id, &owner.machine_id, &owner.pool_id]
                 .iter()
-                .any(|value| !valid_identifier(value, MAX_CONVERSATION_ID_CHARS))
-        {
-            return Err(ExternalConversationDispatchError::InvalidPayload);
-        }
+                .any(|value| !valid_identifier(value, MAX_CONVERSATION_ID_CHARS)))
+    {
+        return Err(ExternalConversationDispatchError::InvalidPayload);
     }
     Ok(())
 }
