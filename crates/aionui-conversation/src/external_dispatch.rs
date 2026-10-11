@@ -121,6 +121,16 @@ impl ExternalConversationDispatchService {
             return repeated_persisted_response(record, &request_fingerprint, &self.repository, &self.boot_id).await;
         }
 
+        if let Some(lease) = &request.workspace_lease {
+            crate::remote_workspace_ownership::validate_session(
+                lease,
+                request.target_conversation_id.as_deref(),
+                request.strategy == ExternalConversationDispatchStrategy::New,
+            )
+            .await
+            .map_err(|_| ExternalConversationDispatchError::InvalidPayload)?;
+        }
+
         let now = aionui_common::now_ms();
         let placeholder = ExternalConversationDispatchResponse {
             operation_id: request.operation_id.clone(),
@@ -205,11 +215,27 @@ impl ExternalConversationDispatchService {
         let workspace_rebind = (request.strategy == ExternalConversationDispatchStrategy::Resume)
             .then(|| request.workspace_lease.as_ref().map(|lease| lease.project_root.clone()))
             .flatten();
+        let allow_unbound = request.strategy == ExternalConversationDispatchStrategy::New;
         let instruction = request.instruction;
         let persist_user_message = request.history_message_id.is_none();
         let release_workspace_runtime = request.workspace_lease.is_some();
         let explicit_completion_after_interruption = request.explicit_completion_after_interruption;
+        let remote_lease = request.workspace_lease.clone();
         tokio::spawn(async move {
+            if let Some(lease) = &remote_lease {
+                if crate::remote_workspace_ownership::validate_session(lease, Some(&conversation_id), allow_unbound)
+                    .await
+                    .is_err()
+                {
+                    service
+                        .update_response(&operation_id, |response| {
+                            response.state = ExternalConversationDispatchState::RecoveryRequired;
+                            response.error_message = Some("Remote workspace ownership changed before execution".to_owned());
+                        })
+                        .await;
+                    return;
+                }
+            }
             let started_service = service.clone();
             let started_operation_id = operation_id.clone();
             let waiting_service = service.clone();
@@ -800,6 +826,15 @@ fn validate_workspace_lease(
     {
         return Err(ExternalConversationDispatchError::InvalidPayload);
     }
+    if let Some(owner) = &workspace.ownership {
+        if owner.generation == 0
+            || [&owner.coordinator_id, &owner.machine_id, &owner.pool_id]
+                .iter()
+                .any(|value| !valid_identifier(value, MAX_CONVERSATION_ID_CHARS))
+        {
+            return Err(ExternalConversationDispatchError::InvalidPayload);
+        }
+    }
     Ok(())
 }
 
@@ -1005,6 +1040,7 @@ mod tests {
             job_id: "job-20260815-0012".to_owned(),
             lease_id: "lease-opaque-id".to_owned(),
             project_root: "C:/Git/Holdem_Fork2/hdtf-client".to_owned(),
+            ownership: None,
         });
         assert!(validate_request(&valid).is_ok());
 
@@ -1035,6 +1071,7 @@ mod tests {
             job_id: "job-12".to_owned(),
             lease_id: "lease-12".to_owned(),
             project_root: "D:/workspace".to_owned(),
+            ownership: None,
         });
         assert!(validate_request(&valid).is_ok());
 
@@ -1099,6 +1136,7 @@ mod tests {
             job_id: "job-before-restart".to_owned(),
             lease_id: "lease-before-restart".to_owned(),
             project_root: "C:/Git/Holdem_Fork2/hdtf-client".to_owned(),
+            ownership: None,
         };
         request.workspace_lease = Some(workspace_lease.clone());
         let fingerprint = request_fingerprint(&request).unwrap();

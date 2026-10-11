@@ -136,7 +136,7 @@ pub use extension::{
 };
 pub use external_conversation_dispatch::{
     ConfirmExternalConversationDispatchCompletionRequest, ConfirmExternalConversationDispatchCompletionResponse,
-    ExternalConversationDispatchCapabilities, ExternalConversationDispatchWorkspaceLease,
+    ExternalConversationDispatchCapabilities, ExternalConversationDispatchWorkspaceLease, ExternalWorkspaceOwnership,
 };
 pub use external_conversation_dispatch::{
     ExternalConversationDispatchCreateOptions, ExternalConversationDispatchRequest,

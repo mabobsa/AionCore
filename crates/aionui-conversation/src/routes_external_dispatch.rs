@@ -54,12 +54,13 @@ pub fn external_conversation_dispatch_routes(state: ConversationRouterState) -> 
 async fn dispatch_capabilities() -> Json<ApiResponse<ExternalConversationDispatchCapabilities>> {
     Json(ApiResponse::ok(ExternalConversationDispatchCapabilities {
         schema_version: 3,
-        workspace_lease_version: 2,
+        workspace_lease_version: 3,
         atomic_workspace_rebind: true,
         releases_runtime_on_terminal: true,
         persistent_recovery_state: true,
         explicit_completion_after_interruption: true,
         history_only_reports: true,
+        remote_workspace_ownership: true,
     }))
 }
 

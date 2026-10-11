@@ -38,6 +38,17 @@ pub struct ExternalConversationDispatchWorkspaceLease {
     pub job_id: String,
     pub lease_id: String,
     pub project_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<ExternalWorkspaceOwnership>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalWorkspaceOwnership {
+    pub coordinator_id: String,
+    pub machine_id: String,
+    pub pool_id: String,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -52,6 +63,8 @@ pub struct ExternalConversationDispatchCapabilities {
     pub explicit_completion_after_interruption: bool,
     #[serde(default)]
     pub history_only_reports: bool,
+    #[serde(default)]
+    pub remote_workspace_ownership: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -174,15 +187,17 @@ mod tests {
     fn capabilities_publish_workspace_lease_contract() {
         let value = serde_json::to_value(ExternalConversationDispatchCapabilities {
             schema_version: 1,
-            workspace_lease_version: 2,
+            workspace_lease_version: 3,
             atomic_workspace_rebind: true,
             releases_runtime_on_terminal: true,
             persistent_recovery_state: true,
             explicit_completion_after_interruption: true,
             history_only_reports: true,
+            remote_workspace_ownership: true,
         })
         .unwrap();
-        assert_eq!(value["workspaceLeaseVersion"], 2);
+        assert_eq!(value["workspaceLeaseVersion"], 3);
+        assert_eq!(value["remoteWorkspaceOwnership"], true);
         assert_eq!(value["atomicWorkspaceRebind"], true);
         assert_eq!(value["explicitCompletionAfterInterruption"], true);
         assert_eq!(value["historyOnlyReports"], true);
@@ -219,6 +234,7 @@ mod tests {
                 job_id: "job-12".to_owned(),
                 lease_id: "lease-opaque".to_owned(),
                 project_root: "C:/Git/Holdem_Fork2/hdtf-client".to_owned(),
+                ownership: None,
             }),
             turn_id: Some("turn-2".to_owned()),
             error_message: None,
