@@ -7,6 +7,7 @@ mod background_stream;
 mod convert;
 pub mod error;
 mod external_dispatch;
+mod remote_workspace_ownership;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;
