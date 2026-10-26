@@ -73,4 +73,40 @@ mod tests {
 
         assert!(result.is_none());
     }
+
+    #[test]
+    fn preserves_account_usage_when_serializing_the_web_response() {
+        let path = test_path("accounts");
+        let published = serde_json::json!({
+            "schemaVersion": 1,
+            "state": "partial",
+            "generatedAt": "2026-10-26T00:00:00.000Z",
+            "updatedAt": "2026-10-26T00:00:00.000Z",
+            "retryAfterMs": null,
+            "claude": {"state": "unavailable", "updatedAt": null, "session": null, "weekly": null},
+            "codex": {
+                "state": "unavailable", "updatedAt": null, "weekly": null, "limitReached": false
+            },
+            "claudeAccounts": [
+                {
+                    "id": "max", "number": 1, "label": "Personal Max",
+                    "state": "ready", "updatedAt": "2026-10-26T00:00:00.000Z",
+                    "session": {"usedPercent": 9, "resetsAt": null},
+                    "weekly": {"usedPercent": 87, "resetsAt": "2026-10-27T00:00:00.000Z"}
+                },
+                {
+                    "id": "default", "number": 2, "label": "Company Team",
+                    "state": "unavailable", "updatedAt": null, "session": null, "weekly": null
+                }
+            ]
+        });
+        fs::write(&path, serde_json::to_vec(&published).unwrap()).unwrap();
+
+        let snapshot = read_subscription_usage_from_path(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let response = serde_json::to_value(aionui_api_types::ApiResponse::ok(Some(snapshot))).unwrap();
+
+        assert_eq!(response["data"]["claudeAccounts"], published["claudeAccounts"]);
+        assert_eq!(response["data"]["claude"], published["claude"]);
+    }
 }

@@ -33,6 +33,17 @@ pub struct ClaudeSubscriptionUsage {
     pub weekly: Option<SubscriptionUsageWindow>,
 }
 
+/// Fork: account metadata and usage published by the desktop in shared account order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeAccountSubscriptionUsage {
+    pub id: String,
+    pub number: u32,
+    pub label: String,
+    #[serde(flatten)]
+    pub usage: ClaudeSubscriptionUsage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSubscriptionUsageWindow {
@@ -60,6 +71,9 @@ pub struct SubscriptionUsageSnapshot {
     pub retry_after_ms: Option<u64>,
     pub claude: ClaudeSubscriptionUsage,
     pub codex: CodexSubscriptionUsage,
+    /// Present only for multiple accounts; `claude` remains the default account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_accounts: Option<Vec<ClaudeAccountSubscriptionUsage>>,
 }
 
 #[cfg(test)]
@@ -97,6 +111,8 @@ mod tests {
 
         assert_eq!(snapshot.state, SubscriptionUsageState::Ready);
         assert_eq!(snapshot.claude.state, ProviderUsageState::Ready);
-        assert_eq!(snapshot.codex.weekly.unwrap().used_percent, 73);
+        assert_eq!(snapshot.codex.weekly.as_ref().unwrap().used_percent, 73);
+        assert!(snapshot.claude_accounts.is_none());
+        assert!(serde_json::to_value(snapshot).unwrap().get("claudeAccounts").is_none());
     }
 }
