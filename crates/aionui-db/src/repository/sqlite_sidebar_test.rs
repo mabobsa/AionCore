@@ -180,6 +180,7 @@ async fn thin_conversations_exclude_archived_and_other_users() {
     let active = store.list_conversations_thin(USER, ArchiveScope::Active).await.unwrap();
     let ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, vec!["live"], "archived and cross-user rows excluded");
+    assert_eq!(active[0].archived_at, None);
 
     // The scope flip selects the complementary slice: same user, archived only.
     let archived = store
@@ -191,6 +192,11 @@ async fn thin_conversations_exclude_archived_and_other_users() {
         ids,
         vec!["archived"],
         "archived scope selects only archived, still user-scoped"
+    );
+    assert_eq!(archived[0].archived_at, Some(999));
+    assert_eq!(
+        archived[0].updated_at, 20,
+        "activity timestamp is not replaced by archive time"
     );
 }
 
@@ -209,11 +215,14 @@ async fn thin_teams_fold_blank_workspace_and_exclude_archived() {
     assert_eq!(rows[0].workspace.as_deref(), Some("/team/ws"));
     assert_eq!(rows[0].project_id.as_deref(), Some("proj-A"));
     assert_eq!(rows[1].workspace, None, "empty team workspace folds to None");
+    assert_eq!(rows[0].archived_at, None);
 
     // Scope flip: only the archived team, still user-scoped.
     let archived = store.list_teams_thin(USER, ArchiveScope::Archived).await.unwrap();
     let ids: Vec<&str> = archived.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, vec!["t3"], "archived scope selects only archived team");
+    assert_eq!(archived[0].archived_at, Some(1));
+    assert_eq!(archived[0].updated_at, 10);
 }
 
 #[tokio::test]

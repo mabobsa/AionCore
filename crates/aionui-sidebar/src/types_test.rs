@@ -61,7 +61,7 @@ fn activity_cursor_round_trips() {
         item_id: "c1".into(),
     };
     let encoded = cursor.encode(&scope);
-    assert_eq!(Cursor::decode(&encoded, &scope).unwrap(), cursor);
+    assert_eq!(Cursor::decode(&encoded, &scope, ArchiveScope::Active).unwrap(), cursor);
 }
 
 #[test]
@@ -73,19 +73,19 @@ fn pinned_cursor_round_trips() {
         item_id: "t1".into(),
     };
     let encoded = cursor.encode(&scope);
-    assert_eq!(Cursor::decode(&encoded, &scope).unwrap(), cursor);
+    assert_eq!(Cursor::decode(&encoded, &scope, ArchiveScope::Active).unwrap(), cursor);
 }
 
 #[test]
 fn cursor_rejects_bad_base64() {
-    let err = Cursor::decode("*** not base64 ***", &ScopeToken::Pinned).unwrap_err();
+    let err = Cursor::decode("*** not base64 ***", &ScopeToken::Pinned, ArchiveScope::Active).unwrap_err();
     assert!(matches!(err, SidebarError::BadRequest(_)));
 }
 
 #[test]
 fn cursor_rejects_bad_json() {
     let raw = B64.encode(b"{not json");
-    let err = Cursor::decode(&raw, &ScopeToken::Pinned).unwrap_err();
+    let err = Cursor::decode(&raw, &ScopeToken::Pinned, ArchiveScope::Active).unwrap_err();
     assert!(matches!(err, SidebarError::BadRequest(_)));
 }
 
@@ -97,7 +97,7 @@ fn cursor_rejects_version_mismatch() {
         }))
         .unwrap(),
     );
-    let err = Cursor::decode(&raw, &ScopeToken::Pinned).unwrap_err();
+    let err = Cursor::decode(&raw, &ScopeToken::Pinned, ArchiveScope::Active).unwrap_err();
     assert!(matches!(err, SidebarError::BadRequest(_)));
 }
 
@@ -110,7 +110,7 @@ fn cursor_rejects_cross_scope_replay() {
         item_id: "c1".into(),
     }
     .encode(&ScopeToken::Project("P1".into()));
-    let err = Cursor::decode(&minted, &ScopeToken::Project("P2".into())).unwrap_err();
+    let err = Cursor::decode(&minted, &ScopeToken::Project("P2".into()), ArchiveScope::Active).unwrap_err();
     assert!(matches!(err, SidebarError::BadRequest(_)));
 }
 
@@ -123,8 +123,61 @@ fn cursor_rejects_missing_keyset_field() {
         }))
         .unwrap(),
     );
-    let err = Cursor::decode(&raw, &ScopeToken::Pinned).unwrap_err();
+    let err = Cursor::decode(&raw, &ScopeToken::Pinned, ArchiveScope::Active).unwrap_err();
     assert!(matches!(err, SidebarError::BadRequest(_)));
+}
+
+#[test]
+fn archived_cursor_round_trips_and_rejects_cross_scope_replay() {
+    let scope = ScopeToken::Project("P1".into());
+    let cursor = Cursor::Archived {
+        archived_at: 500,
+        item_type: "conversation".into(),
+        item_id: "c1".into(),
+    };
+    let encoded = cursor.encode(&scope);
+    assert_eq!(
+        Cursor::decode(&encoded, &scope, ArchiveScope::Archived).unwrap(),
+        cursor
+    );
+    let err = Cursor::decode(&encoded, &ScopeToken::Project("P2".into()), ArchiveScope::Archived).unwrap_err();
+    assert!(matches!(err, SidebarError::BadRequest(message) if message == "cursor belongs to a different scope"));
+}
+
+#[test]
+fn cursors_reject_legacy_archive_order_and_cross_slice_replay() {
+    let scope = ScopeToken::Chats;
+    // This is also the format previously issued for archive pages.
+    let activity = Cursor::Activity {
+        updated_at: 50,
+        item_type: "conversation".into(),
+        item_id: "c1".into(),
+    }
+    .encode(&scope);
+    let archived = Cursor::Archived {
+        archived_at: 500,
+        item_type: "conversation".into(),
+        item_id: "c1".into(),
+    }
+    .encode(&scope);
+    for (raw, slice) in [(&activity, ArchiveScope::Archived), (&archived, ArchiveScope::Active)] {
+        let err = Cursor::decode(raw, &scope, slice).unwrap_err();
+        assert!(matches!(err, SidebarError::BadRequest(message) if message == "cursor version mismatch"));
+    }
+    assert!(Cursor::decode(&activity, &scope, ArchiveScope::Active).is_ok());
+}
+
+#[test]
+fn archived_cursor_requires_archive_time() {
+    let raw = B64.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "v": ARCHIVED_CURSOR_VERSION, "scope": "chats", "updated_at": 50,
+            "item_type": "conversation", "item_id": "c1"
+        }))
+        .unwrap(),
+    );
+    let err = Cursor::decode(&raw, &ScopeToken::Chats, ArchiveScope::Archived).unwrap_err();
+    assert!(matches!(err, SidebarError::BadRequest(message) if message == "archive cursor missing archived_at"));
 }
 
 // -- parse_win ---------------------------------------------------------------

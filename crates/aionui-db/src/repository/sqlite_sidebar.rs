@@ -52,6 +52,16 @@ fn placeholders(count: usize) -> String {
 
 #[async_trait::async_trait]
 impl ISidebarStore for SqliteSidebarStore {
+    async fn conversation_archive_state(&self, user_id: &str, id: &str) -> Result<Option<Option<i64>>, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, Option<i64>>("SELECT archived_at FROM conversations WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     async fn list_conversations_thin(
         &self,
         user_id: &str,
@@ -65,7 +75,7 @@ impl ISidebarStore for SqliteSidebarStore {
                     NULLIF(project_id, '') AS project_id, \
                     json_extract(extra, '$.workspace') AS workspace, \
                     COALESCE(NULLIF(json_extract(extra, '$.team_id'), ''), NULLIF(json_extract(extra, '$.teamId'), '')) AS team_id, \
-                    updated_at, created_at \
+                    updated_at, created_at, archived_at \
              FROM conversations \
              WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP}"
         );
@@ -80,6 +90,7 @@ impl ISidebarStore for SqliteSidebarStore {
                 team_id: non_blank(row.get("team_id")),
                 updated_at: row.get("updated_at"),
                 created_at: row.get("created_at"),
+                archived_at: row.get("archived_at"),
             })
             .collect())
     }
@@ -89,7 +100,7 @@ impl ISidebarStore for SqliteSidebarStore {
         let sql = format!(
             "SELECT id, name, \
                     NULLIF(project_id, '') AS project_id, \
-                    workspace, updated_at, created_at \
+                    workspace, updated_at, created_at, archived_at \
              FROM teams \
              WHERE user_id = ? AND {archived}"
         );
@@ -104,6 +115,7 @@ impl ISidebarStore for SqliteSidebarStore {
                 workspace: non_blank(row.get("workspace")),
                 updated_at: row.get("updated_at"),
                 created_at: row.get("created_at"),
+                archived_at: row.get("archived_at"),
             })
             .collect())
     }

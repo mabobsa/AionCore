@@ -41,7 +41,7 @@ use crate::types::{
 };
 
 /// Project-area hard cap: the interleaved (project + pseudo-dir) group list is
-/// truncated to this many groups, ordered by activity (BR-5).
+/// truncated to this many groups, ordered by activity or archive time (BR-5).
 const MAX_PROJECT_GROUPS: usize = 100;
 
 /// Standard-project kind marker (`projects.kind`).
@@ -122,6 +122,27 @@ impl SidebarService {
     }
 
     // -- Archive (D6: archiving unpins) --------------------------------------
+
+    pub async fn conversation_archive_state(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<aionui_api_types::ConversationArchiveState, SidebarError> {
+        if id.is_empty()
+            || id.len() > 120
+            || !id
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-' || ch == b'_')
+        {
+            return Err(SidebarError::BadRequest("invalid conversation id".into()));
+        }
+        let archived_at = self.sidebar.conversation_archive_state(user_id, id).await?;
+        Ok(aionui_api_types::ConversationArchiveState {
+            conversation_id: id.to_owned(),
+            exists: archived_at.is_some(),
+            archived_at: archived_at.flatten(),
+        })
+    }
 
     /// Archive a conversation: move it into the archived slice, then drop any
     /// pinned row (D6 — an archived item is never pinned). A missing / foreign id
@@ -711,6 +732,7 @@ impl SidebarService {
     // -- Read side (first screen / paging) -----------------------------------
 
     /// First screen: `pinned → project-area (project + dir interleaved) → chats`.
+    /// The archived slice instead orders all populated groups by archive time.
     /// `win` is the already-parsed per-scope window overrides; `limit` is the
     /// default window for any scope not named in `win`.
     pub async fn first_screen(
@@ -743,10 +765,17 @@ impl SidebarService {
             }
         }
 
-        // Natural groups: project area (already ordered) then chats. Collect the
-        // windowed conversation ids across all of them for a single hydration.
+        // Active groups keep chats last; archived groups all follow archive time.
+        // Collect windowed conversation ids across them for a single hydration.
         let mut natural: Vec<&NaturalGroup> = snapshot.project_area.iter().collect();
         natural.push(&snapshot.chats);
+        if scope == ArchiveScope::Archived {
+            natural.sort_by(|a, b| {
+                b.latest_sort_at
+                    .cmp(&a.latest_sort_at)
+                    .then_with(|| b.token_str.cmp(&a.token_str))
+            });
+        }
 
         let mut conv_ids: Vec<String> = Vec::new();
         let mut windows: Vec<(&NaturalGroup, usize, bool)> = Vec::with_capacity(natural.len());
@@ -767,12 +796,7 @@ impl SidebarService {
         for (group, take, has_more) in windows {
             let items = assemble_items(&group.items[..take], &hydrated, &snapshot.team_by_id, false);
             let next_cursor = has_more
-                .then(|| {
-                    group
-                        .items
-                        .get(take - 1)
-                        .map(|i| i.activity_cursor().encode(&group.token))
-                })
+                .then(|| group.items.get(take - 1).map(|i| i.cursor(scope).encode(&group.token)))
                 .flatten();
             groups.push(SidebarGroup {
                 scope: group.scope.clone(),
@@ -809,7 +833,7 @@ impl SidebarService {
                 return Err(SidebarError::ScopeGone);
             }
             let after = match cursor {
-                Some(raw) => Some(to_pinned_cursor(Cursor::decode(raw, &token)?)?),
+                Some(raw) => Some(to_pinned_cursor(Cursor::decode(raw, &token, archive)?)?),
                 None => None,
             };
             let team_by_id = self.load_team_aggregates(user_id, ArchiveScope::Active).await?;
@@ -832,7 +856,7 @@ impl SidebarService {
                 .ok_or(SidebarError::ScopeGone)?,
         };
         let cursor = match cursor {
-            Some(raw) => Some(Cursor::decode(raw, &token)?),
+            Some(raw) => Some(Cursor::decode(raw, &token, archive)?),
             None => None,
         };
         self.page_natural(user_id, group, cursor.as_ref(), limit, archive).await
@@ -864,7 +888,7 @@ impl SidebarService {
         let window: Vec<GroupItemRef> = after[..take].iter().map(|i| (*i).clone()).collect();
         let items = assemble_items(&window, &hydrated, &group.team_by_id_ref(), false);
         let next_cursor = has_more
-            .then(|| window.last().map(|i| i.activity_cursor().encode(&group.token)))
+            .then(|| window.last().map(|i| i.cursor(scope).encode(&group.token)))
             .flatten();
         Ok(SidebarItemsResponse {
             items,
@@ -1035,11 +1059,10 @@ impl SidebarService {
             builder.push(
                 key,
                 &by_id,
-                agg.updated_at,
                 pinned,
                 GroupItemRef::Team {
                     team_id: team.id.clone(),
-                    updated_at: agg.updated_at,
+                    sort_at: natural_sort_at(scope, agg.updated_at, team.archived_at)?,
                 },
             );
         }
@@ -1056,11 +1079,10 @@ impl SidebarService {
             builder.push(
                 key,
                 &by_id,
-                conv.updated_at,
                 pinned,
                 GroupItemRef::Conv {
                     id: conv.id.clone(),
-                    updated_at: conv.updated_at,
+                    sort_at: natural_sort_at(scope, conv.updated_at, conv.archived_at)?,
                 },
             );
         }
@@ -1141,9 +1163,9 @@ struct Snapshot {
 struct TeamAgg {
     team_id: String,
     name: String,
-    /// `MAX(updated_at)` over active members, else the team's own `updated_at`.
+    /// `MAX(updated_at)` over members in this slice, else the team's own timestamp.
     updated_at: i64,
-    /// Active member conversation ids, `created_at` ascending.
+    /// Member conversation ids in this slice, `created_at` ascending.
     member_ids: Vec<String>,
 }
 
@@ -1152,7 +1174,8 @@ struct NaturalGroup {
     scope: SidebarScope,
     token: ScopeToken,
     token_str: String,
-    /// Sorted later-first (updated_at DESC, then item-type ASC, then id ASC).
+    latest_sort_at: Option<i64>,
+    /// Sorted later-first (activity/archive time DESC, item-type ASC, id ASC).
     items: Vec<GroupItemRef>,
     /// Shared team aggregates (set at finish); assembly reads names/members here.
     team_by_id: Arc<HashMap<String, TeamAgg>>,
@@ -1166,14 +1189,14 @@ impl NaturalGroup {
 
 #[derive(Clone)]
 enum GroupItemRef {
-    Conv { id: String, updated_at: i64 },
-    Team { team_id: String, updated_at: i64 },
+    Conv { id: String, sort_at: i64 },
+    Team { team_id: String, sort_at: i64 },
 }
 
 impl GroupItemRef {
-    fn updated_at(&self) -> i64 {
+    fn sort_at(&self) -> i64 {
         match self {
-            GroupItemRef::Conv { updated_at, .. } | GroupItemRef::Team { updated_at, .. } => *updated_at,
+            GroupItemRef::Conv { sort_at, .. } | GroupItemRef::Team { sort_at, .. } => *sort_at,
         }
     }
 
@@ -1198,33 +1221,47 @@ impl GroupItemRef {
         }
     }
 
-    fn activity_cursor(&self) -> Cursor {
-        Cursor::Activity {
-            updated_at: self.updated_at(),
-            item_type: self.item_type_str().to_owned(),
-            item_id: self.item_id().to_owned(),
+    fn cursor(&self, scope: ArchiveScope) -> Cursor {
+        match scope {
+            ArchiveScope::Active => Cursor::Activity {
+                updated_at: self.sort_at(),
+                item_type: self.item_type_str().to_owned(),
+                item_id: self.item_id().to_owned(),
+            },
+            ArchiveScope::Archived => Cursor::Archived {
+                archived_at: self.sort_at(),
+                item_type: self.item_type_str().to_owned(),
+                item_id: self.item_id().to_owned(),
+            },
         }
     }
 
     /// Is this item strictly after `cursor` in later-first order? `None` cursor
     /// means "from the top" (everything qualifies).
     ///
-    /// Later-first: a comes before b iff `a.updated_at > b.updated_at`, or on a
+    /// Later-first: a comes before b iff `a.sort_at > b.sort_at`, or on a
     /// tie iff `(a.type_ord, a.id) < (b.type_ord, b.id)`. So "after the cursor"
-    /// is: smaller `updated_at`, or equal `updated_at` with a larger
+    /// is: smaller `sort_at`, or equal `sort_at` with a larger
     /// `(type_ord, id)` pair.
     fn is_after(&self, cursor: Option<&Cursor>) -> bool {
-        let Some(Cursor::Activity {
-            updated_at,
-            item_type,
-            item_id,
-        }) = cursor
+        let Some(
+            Cursor::Activity {
+                updated_at: sort_at,
+                item_type,
+                item_id,
+            }
+            | Cursor::Archived {
+                archived_at: sort_at,
+                item_type,
+                item_id,
+            },
+        ) = cursor
         else {
             return true;
         };
         let cur = (type_ord_of(item_type), item_id.as_str());
         let this = (self.type_ord(), self.item_id());
-        self.updated_at() < *updated_at || (self.updated_at() == *updated_at && this > cur)
+        self.sort_at() < *sort_at || (self.sort_at() == *sort_at && this > cur)
     }
 }
 
@@ -1236,15 +1273,15 @@ enum GroupKey {
     Chats,
 }
 
-/// Accumulates units into groups, tracking activity for ordering.
+/// Accumulates units into groups, tracking the selected timestamp for ordering.
 struct GroupBuilder {
     map: HashMap<GroupKey, GroupAccum>,
 }
 
 struct GroupAccum {
     items: Vec<GroupItemRef>,
-    /// MAX(updated_at) over ALL units incl pinned (group order, BR-6).
-    latest_activity: Option<i64>,
+    /// MAX(sort_at) over ALL units incl pinned (activity or archive ordering).
+    latest_sort_at: Option<i64>,
     /// created_at fallback for empty standard-project groups.
     created_at: i64,
     /// Cached DTO scope + tokens (filled when the group is first created).
@@ -1258,19 +1295,13 @@ impl GroupBuilder {
         Self { map: HashMap::new() }
     }
 
-    fn push(
-        &mut self,
-        key: GroupKey,
-        by_id: &HashMap<&str, &SidebarProjectMeta>,
-        updated_at: i64,
-        pinned: bool,
-        item: GroupItemRef,
-    ) {
+    fn push(&mut self, key: GroupKey, by_id: &HashMap<&str, &SidebarProjectMeta>, pinned: bool, item: GroupItemRef) {
         let accum = self
             .map
             .entry(key.clone())
             .or_insert_with(|| GroupAccum::new(&key, by_id));
-        accum.latest_activity = Some(accum.latest_activity.map_or(updated_at, |a| a.max(updated_at)));
+        let sort_at = item.sort_at();
+        accum.latest_sort_at = Some(accum.latest_sort_at.map_or(sort_at, |a| a.max(sort_at)));
         if !pinned {
             accum.items.push(item);
         }
@@ -1280,7 +1311,7 @@ impl GroupBuilder {
         let key = GroupKey::Project(project.project_id.clone());
         self.map.entry(key).or_insert_with(|| GroupAccum {
             items: Vec::new(),
-            latest_activity: None,
+            latest_sort_at: None,
             created_at: project.created_at,
             scope: project_scope(project),
             token: ScopeToken::Project(project.project_id.clone()),
@@ -1308,7 +1339,7 @@ impl GroupBuilder {
         let chats = chats
             .unwrap_or_else(|| GroupAccum {
                 items: Vec::new(),
-                latest_activity: None,
+                latest_sort_at: None,
                 created_at: 0,
                 scope: SidebarScope::Chats,
                 token: ScopeToken::Chats,
@@ -1328,7 +1359,7 @@ impl GroupAccum {
                 let meta = by_id.get(pid.as_str()).expect("project key without meta");
                 GroupAccum {
                     items: Vec::new(),
-                    latest_activity: None,
+                    latest_sort_at: None,
                     created_at: meta.created_at,
                     scope: project_scope(meta),
                     token: ScopeToken::Project(pid.clone()),
@@ -1339,7 +1370,7 @@ impl GroupAccum {
                 let (path, name) = dir_display(canonical);
                 GroupAccum {
                     items: Vec::new(),
-                    latest_activity: None,
+                    latest_sort_at: None,
                     created_at: 0,
                     scope: SidebarScope::Dir {
                         key: canonical_to_dir_key(canonical),
@@ -1352,7 +1383,7 @@ impl GroupAccum {
             }
             GroupKey::Chats => GroupAccum {
                 items: Vec::new(),
-                latest_activity: None,
+                latest_sort_at: None,
                 created_at: 0,
                 scope: SidebarScope::Chats,
                 token: ScopeToken::Chats,
@@ -1367,6 +1398,7 @@ impl GroupAccum {
             scope: self.scope,
             token: self.token,
             token_str: self.token_str,
+            latest_sort_at: self.latest_sort_at,
             items: self.items,
             team_by_id,
         }
@@ -1374,6 +1406,16 @@ impl GroupAccum {
 }
 
 // -- Free helpers ------------------------------------------------------------
+
+/// Preserve activity timestamps in the DTO; only the ordering key changes.
+fn natural_sort_at(scope: ArchiveScope, updated_at: i64, archived_at: Option<i64>) -> Result<i64, SidebarError> {
+    match scope {
+        ArchiveScope::Active => Ok(updated_at),
+        ArchiveScope::Archived => {
+            archived_at.ok_or_else(|| SidebarError::Internal("archived sidebar item missing archived_at".into()))
+        }
+    }
+}
 
 /// Fold conversations into their live team; return (team aggregates, independents).
 /// A member whose `team_id` names no live team is an orphan and downgrades to an
@@ -1411,11 +1453,11 @@ fn aggregate_teams(
     (team_by_id, independents)
 }
 
-/// Group order (BR-6): active groups by latest_activity DESC; empty standard
+/// Group order (BR-6): populated groups by latest activity/archive time DESC; empty standard
 /// projects sink below and order by created_at DESC; ties break by token DESC.
 fn cmp_group(a: &GroupAccum, b: &GroupAccum) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    match (a.latest_activity, b.latest_activity) {
+    match (a.latest_sort_at, b.latest_sort_at) {
         (Some(x), Some(y)) => y.cmp(&x).then_with(|| b.token_str.cmp(&a.token_str)),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
@@ -1426,11 +1468,11 @@ fn cmp_group(a: &GroupAccum, b: &GroupAccum) -> std::cmp::Ordering {
     }
 }
 
-/// Item order within a group: later-first (updated_at DESC), tie-break
+/// Item order within a group: later-first (activity/archive time DESC), tie-break
 /// (item_type ASC, id ASC) — matching the keyset cursor's "strictly after".
 fn cmp_item(a: &GroupItemRef, b: &GroupItemRef) -> std::cmp::Ordering {
-    b.updated_at()
-        .cmp(&a.updated_at())
+    b.sort_at()
+        .cmp(&a.sort_at())
         .then_with(|| a.type_ord().cmp(&b.type_ord()))
         .then_with(|| a.item_id().cmp(b.item_id()))
 }
@@ -1540,7 +1582,9 @@ fn to_pinned_cursor(cursor: Cursor) -> Result<PinnedCursor, SidebarError> {
                 item_id,
             })
         }
-        Cursor::Activity { .. } => Err(SidebarError::BadRequest("expected a pinned cursor".into())),
+        Cursor::Activity { .. } | Cursor::Archived { .. } => {
+            Err(SidebarError::BadRequest("expected a pinned cursor".into()))
+        }
     }
 }
 

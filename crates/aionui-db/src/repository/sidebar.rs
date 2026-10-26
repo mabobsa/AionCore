@@ -52,6 +52,8 @@ pub struct SidebarConversationThin {
     pub team_id: Option<String>,
     pub updated_at: i64,
     pub created_at: i64,
+    /// Archive ordering uses this timestamp, independently of conversation activity.
+    pub archived_at: Option<i64>,
 }
 
 /// A team reduced to what sidebar classification needs. The path source is the
@@ -65,6 +67,7 @@ pub struct SidebarTeamThin {
     pub workspace: Option<String>,
     pub updated_at: i64,
     pub created_at: i64,
+    pub archived_at: Option<i64>,
 }
 
 /// Project spine metadata: a project plus its workspace folder identity.
@@ -96,6 +99,9 @@ pub struct SidebarProjectMeta {
 /// binding resolves to nothing and degrades to a dangling id (BR-24).
 #[async_trait::async_trait]
 pub trait ISidebarStore: Send + Sync {
+    /// Outer `None`: missing or not owned. Inner `None`: present, active.
+    async fn conversation_archive_state(&self, user_id: &str, id: &str) -> Result<Option<Option<i64>>, DbError>;
+
     /// All conversations for a user in the given archive slice, thin.
     async fn list_conversations_thin(
         &self,

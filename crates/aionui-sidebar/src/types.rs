@@ -9,12 +9,14 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64_URL};
 use serde::{Deserialize, Serialize};
 
-use aionui_db::DbError;
+use aionui_db::{ArchiveScope, DbError};
 use aionui_project::ProjectError;
 
-/// Cursor / group-ordering version. Bumped when the keyset ordering changes so a
-/// stale client cursor is rejected (400) instead of silently mis-paging.
+/// Active cursor ordering version, retained for existing active/pinned pages.
 pub const CURSOR_VERSION: u32 = 1;
+/// Archive cursors sort by archive time. Active/pinned cursors stay on v1;
+/// old activity-based archive cursors must be rejected instead of mis-paging.
+pub const ARCHIVED_CURSOR_VERSION: u32 = 2;
 
 /// Default per-group window when the request omits `limit` / a `win` entry.
 pub const DEFAULT_LIMIT: i64 = 5;
@@ -106,8 +108,8 @@ pub fn dir_key_to_canonical(key: &str) -> Option<String> {
 }
 
 /// Keyset cursor position within a group. `Pinned` scopes page by `order_key`
-/// ascending; every other scope pages by `updated_at` descending. Both tie-break
-/// on the full `(item_type, item_id)` pair, so no position is ambiguous.
+/// ascending; natural scopes page by activity (active) or archive time (archived)
+/// descending. All tie-break on `(item_type, item_id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cursor {
     Pinned {
@@ -117,6 +119,11 @@ pub enum Cursor {
     },
     Activity {
         updated_at: i64,
+        item_type: String,
+        item_id: String,
+    },
+    Archived {
+        archived_at: i64,
         item_type: String,
         item_id: String,
     },
@@ -133,6 +140,8 @@ struct CursorPayload {
     order_key: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archived_at: Option<i64>,
     item_type: String,
     item_id: String,
 }
@@ -150,6 +159,7 @@ impl Cursor {
                 scope: scope.to_token(),
                 order_key: Some(*order_key),
                 updated_at: None,
+                archived_at: None,
                 item_type: item_type.clone(),
                 item_id: item_id.clone(),
             },
@@ -162,6 +172,20 @@ impl Cursor {
                 scope: scope.to_token(),
                 order_key: None,
                 updated_at: Some(*updated_at),
+                archived_at: None,
+                item_type: item_type.clone(),
+                item_id: item_id.clone(),
+            },
+            Cursor::Archived {
+                archived_at,
+                item_type,
+                item_id,
+            } => CursorPayload {
+                v: ARCHIVED_CURSOR_VERSION,
+                scope: scope.to_token(),
+                order_key: None,
+                updated_at: None,
+                archived_at: Some(*archived_at),
                 item_type: item_type.clone(),
                 item_id: item_id.clone(),
             },
@@ -174,17 +198,34 @@ impl Cursor {
     /// Decode a cursor and verify it was minted for `scope` at this ordering
     /// version. Bad base64 / bad JSON / wrong version / cross-scope / missing
     /// keyset field → `BadRequest` (never a silent reset to the first page).
-    pub fn decode(raw: &str, scope: &ScopeToken) -> Result<Self, SidebarError> {
+    pub fn decode(raw: &str, scope: &ScopeToken, archive: ArchiveScope) -> Result<Self, SidebarError> {
         let bytes = B64
             .decode(raw.as_bytes())
             .map_err(|_| SidebarError::BadRequest("cursor is not valid base64".into()))?;
         let payload: CursorPayload =
             serde_json::from_slice(&bytes).map_err(|_| SidebarError::BadRequest("cursor JSON is malformed".into()))?;
-        if payload.v != CURSOR_VERSION {
+        let expected_version = match archive {
+            ArchiveScope::Active => CURSOR_VERSION,
+            ArchiveScope::Archived => ARCHIVED_CURSOR_VERSION,
+        };
+        if payload.v != expected_version {
             return Err(SidebarError::BadRequest("cursor version mismatch".into()));
         }
         if payload.scope != scope.to_token() {
             return Err(SidebarError::BadRequest("cursor belongs to a different scope".into()));
+        }
+        if archive == ArchiveScope::Archived {
+            if matches!(scope, ScopeToken::Pinned) {
+                return Err(SidebarError::BadRequest("archive has no pinned cursor".into()));
+            }
+            let archived_at = payload
+                .archived_at
+                .ok_or_else(|| SidebarError::BadRequest("archive cursor missing archived_at".into()))?;
+            return Ok(Cursor::Archived {
+                archived_at,
+                item_type: payload.item_type,
+                item_id: payload.item_id,
+            });
         }
         match scope {
             ScopeToken::Pinned => {

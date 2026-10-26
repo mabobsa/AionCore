@@ -24,8 +24,118 @@ use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
 const USER: &str = "user-1";
 const OTHER: &str = "user-2";
 
+#[path = "service_archive_order_test.rs"]
+mod archive_order;
+
 #[path = "service_archive_events_test.rs"]
 mod archive_events;
+
+#[tokio::test]
+async fn archive_state_route_distinguishes_owned_active_archived_and_missing() {
+    use axum::{Extension, body::Body, http::Request};
+    use tower::ServiceExt;
+    let f = fixture().await;
+    insert_conv(f.pool(), USER, "active", None, "{}", 1).await;
+    insert_conv(f.pool(), USER, "archived", None, "{}", 1).await;
+    insert_conv(f.pool(), OTHER, "foreign", None, "{}", 1).await;
+    archive_conv(f.pool(), "archived", 123).await;
+    archive_conv(f.pool(), "foreign", 456).await;
+    let service = Arc::new(f.service);
+    let user = aionui_auth::CurrentUser {
+        id: USER.into(),
+        ..aionui_auth::CurrentUser::local_default()
+    };
+    let app = crate::sidebar_routes(crate::SidebarRouterState {
+        service: service.clone(),
+    })
+    .layer(Extension(user));
+    for (id, exists, at) in [
+        ("active", true, None),
+        ("archived", true, Some(123)),
+        ("missing", false, None),
+        ("foreign", false, None),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sidebar/conversation/{id}/archive-state"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["data"],
+            serde_json::json!({ "conversation_id": id, "exists": exists, "archived_at": at })
+        );
+    }
+    service.archive_conversation(USER, "active").await.unwrap();
+    assert!(
+        service
+            .conversation_archive_state(USER, "active")
+            .await
+            .unwrap()
+            .archived_at
+            .is_some()
+    );
+    service.unarchive_conversation(USER, "active").await.unwrap();
+    assert!(
+        service
+            .conversation_archive_state(USER, "active")
+            .await
+            .unwrap()
+            .archived_at
+            .is_none()
+    );
+    for id in ["bad.id", "a".repeat(121).as_str()] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sidebar/conversation/{id}/archive-state"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "sidebar_bad_request");
+    }
+}
+
+#[tokio::test]
+async fn archive_state_requires_authentication() {
+    use aionui_auth::{AuthIdentityMode, AuthState, JwtService, auth_middleware};
+    use axum::{body::Body, http::Request, middleware::from_fn_with_state};
+    use tower::ServiceExt;
+    let f = fixture().await;
+    let auth = AuthState {
+        jwt_service: Arc::new(JwtService::new("archive-state-test-secret".into())),
+        user_repo: Arc::new(aionui_db::SqliteUserRepository::new(f.pool().clone())),
+        identity_mode: AuthIdentityMode::UserSession,
+        runtime_token_verifier: None,
+    };
+    let app = crate::sidebar_routes(crate::SidebarRouterState {
+        service: Arc::new(f.service),
+    })
+    .route_layer(from_fn_with_state(auth, auth_middleware));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sidebar/conversation/active/archive-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
 
 // -- Fixture -----------------------------------------------------------------
 

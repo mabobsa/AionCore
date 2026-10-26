@@ -59,6 +59,10 @@ pub fn sidebar_routes(state: SidebarRouterState) -> Router {
             delete(delete_archived_project),
         )
         .route("/api/sidebar/conversation/{id}/archive", post(archive_conversation))
+        .route(
+            "/api/sidebar/conversation/{id}/archive-state",
+            get(conversation_archive_state),
+        )
         .route("/api/sidebar/conversation/{id}/unarchive", post(unarchive_conversation))
         .route("/api/sidebar/team/{id}/archive", post(archive_team))
         .route("/api/sidebar/team/{id}/unarchive", post(unarchive_team))
@@ -308,6 +312,20 @@ async fn delete_archived_team(
 
 /// `POST /api/sidebar/conversation/{id}/archive` — move a conversation into the
 /// archive slice and unpin it (D6). Unknown / foreign id → 404.
+async fn conversation_archive_state(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::ConversationArchiveState>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .conversation_archive_state(&user.id, &id)
+            .await
+            .map_err(to_api_error)?,
+    )))
+}
+
 async fn archive_conversation(
     State(state): State<SidebarRouterState>,
     Extension(user): Extension<CurrentUser>,

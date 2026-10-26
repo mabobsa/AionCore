@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::conversation::ConversationResponse;
 
+/// Single, user-scoped archive lookup. A successful missing result is distinct
+/// from an unsupported endpoint, an authorization error, or a failed request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationArchiveState {
+    pub conversation_id: String,
+    pub exists: bool,
+    pub archived_at: Option<i64>,
+}
+
 /// Root of `GET /api/sidebar`.
 ///
 /// `groups` order **is** render order: `pinned → project-area (project + dir
