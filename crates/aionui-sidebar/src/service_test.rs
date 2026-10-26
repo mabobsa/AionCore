@@ -311,7 +311,7 @@ fn conv_ids(items: &[SidebarItem]) -> Vec<String> {
     let mut ids: Vec<String> = items
         .iter()
         .filter_map(|i| match i {
-            SidebarItem::Conversation { conversation } => Some(conversation.id.clone()),
+            SidebarItem::Conversation { conversation, .. } => Some(conversation.id.clone()),
             SidebarItem::Team(_) => None,
         })
         .collect();
@@ -642,7 +642,7 @@ async fn pinned_item_leaves_its_natural_group() {
     let pinned = find_pinned(&after).expect("pinned group present");
     assert_eq!(conv_ids(&pinned.items), vec!["c4"]);
     let is_pinned = pinned.items.iter().any(
-        |i| matches!(i, SidebarItem::Conversation { conversation } if conversation.id == "c4" && conversation.pinned),
+        |i| matches!(i, SidebarItem::Conversation { conversation, .. } if conversation.id == "c4" && conversation.pinned),
     );
     assert!(is_pinned, "DTO pinned flag overridden to true");
     // B1: c4 no longer double-renders in its natural (dir) group. The dir group

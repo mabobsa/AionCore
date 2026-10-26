@@ -6,7 +6,7 @@ fn ordered_ids(items: &[SidebarItem]) -> Vec<String> {
     items
         .iter()
         .map(|item| match item {
-            SidebarItem::Conversation { conversation } => conversation.id.clone(),
+            SidebarItem::Conversation { conversation, .. } => conversation.id.clone(),
             SidebarItem::Team(team) => team.team_id.clone(),
         })
         .collect()
@@ -30,11 +30,21 @@ async fn archiving_an_old_conversation_moves_it_to_top_without_changing_activity
     let chats = find_chats(&archived);
     assert_eq!(ordered_ids(&chats.items), vec!["old"]);
     assert!(chats.has_more, "the newly archived item is in the first window");
-    let SidebarItem::Conversation { conversation } = &chats.items[0] else {
+    let SidebarItem::Conversation {
+        conversation,
+        archived_at,
+    } = &chats.items[0]
+    else {
         panic!("expected conversation");
     };
     assert_eq!(conversation.created_at, 10);
     assert_eq!(conversation.modified_at, 10, "archive time must not replace activity");
+    let stored_at: i64 = sqlx::query_scalar("SELECT archived_at FROM conversations WHERE id = 'old'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(*archived_at, Some(stored_at));
+    assert_eq!(serde_json::to_value(&chats.items[0]).unwrap()["archived_at"], stored_at);
 
     fx.service.unarchive_conversation(USER, "old").await.unwrap();
     let active = fx
@@ -43,6 +53,9 @@ async fn archiving_an_old_conversation_moves_it_to_top_without_changing_activity
         .await
         .unwrap();
     assert_eq!(ordered_ids(&find_chats(&active).items), vec!["recent", "old"]);
+    for item in &find_chats(&active).items {
+        assert!(serde_json::to_value(item).unwrap().get("archived_at").is_none());
+    }
 
     // Restoring and archiving again must use the new archive event.
     fx.service.archive_conversation(USER, "old").await.unwrap();
@@ -104,6 +117,11 @@ async fn archive_paging_orders_mixed_items_by_archive_time_with_stable_ties() {
             pages += 1;
         }
         assert_eq!(ordered_ids(&seen), vec!["newest", "a", "b", "team", "oldest"]);
+        let archive_dates: Vec<_> = seen
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap()["archived_at"].as_i64().unwrap())
+            .collect();
+        assert_eq!(archive_dates, vec![400, 300, 300, 300, 100]);
         let team = seen
             .iter()
             .find_map(|item| match item {

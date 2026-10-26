@@ -937,7 +937,7 @@ impl SidebarService {
         for row in window {
             if row.item_type == OrderItemType::Conversation.as_str() {
                 if let Some(resp) = hydrated.get(&row.item_id) {
-                    items.push(conversation_item(resp.clone(), true));
+                    items.push(conversation_item(resp.clone(), true, None));
                 }
             } else if let Some(agg) = team_by_id.get(&row.item_id) {
                 items.push(team_item(agg, true));
@@ -1083,6 +1083,7 @@ impl SidebarService {
                 GroupItemRef::Conv {
                     id: conv.id.clone(),
                     sort_at: natural_sort_at(scope, conv.updated_at, conv.archived_at)?,
+                    archived_at: conv.archived_at,
                 },
             );
         }
@@ -1165,6 +1166,7 @@ struct TeamAgg {
     name: String,
     /// `MAX(updated_at)` over members in this slice, else the team's own timestamp.
     updated_at: i64,
+    archived_at: Option<i64>,
     /// Member conversation ids in this slice, `created_at` ascending.
     member_ids: Vec<String>,
 }
@@ -1189,8 +1191,15 @@ impl NaturalGroup {
 
 #[derive(Clone)]
 enum GroupItemRef {
-    Conv { id: String, sort_at: i64 },
-    Team { team_id: String, sort_at: i64 },
+    Conv {
+        id: String,
+        sort_at: i64,
+        archived_at: Option<i64>,
+    },
+    Team {
+        team_id: String,
+        sort_at: i64,
+    },
 }
 
 impl GroupItemRef {
@@ -1446,6 +1455,7 @@ fn aggregate_teams(
                 team_id: team.id,
                 name: team.name,
                 updated_at,
+                archived_at: team.archived_at,
                 member_ids,
             },
         );
@@ -1516,9 +1526,9 @@ fn assemble_items(
     let mut out = Vec::with_capacity(window.len());
     for item in window {
         match item {
-            GroupItemRef::Conv { id, .. } => {
+            GroupItemRef::Conv { id, archived_at, .. } => {
                 if let Some(resp) = hydrated.get(id) {
-                    out.push(conversation_item(resp.clone(), pinned));
+                    out.push(conversation_item(resp.clone(), pinned, *archived_at));
                 }
             }
             GroupItemRef::Team { team_id, .. } => {
@@ -1531,10 +1541,13 @@ fn assemble_items(
     out
 }
 
-fn conversation_item(mut resp: ConversationResponse, pinned: bool) -> SidebarItem {
+fn conversation_item(mut resp: ConversationResponse, pinned: bool, archived_at: Option<i64>) -> SidebarItem {
     resp.pinned = pinned;
     resp.pinned_at = None;
-    SidebarItem::Conversation { conversation: resp }
+    SidebarItem::Conversation {
+        conversation: resp,
+        archived_at,
+    }
 }
 
 fn team_item(agg: &TeamAgg, pinned: bool) -> SidebarItem {
@@ -1542,6 +1555,7 @@ fn team_item(agg: &TeamAgg, pinned: bool) -> SidebarItem {
         team_id: agg.team_id.clone(),
         name: agg.name.clone(),
         updated_at: agg.updated_at,
+        archived_at: agg.archived_at,
         pinned,
         member_conversation_ids: agg.member_ids.clone(),
     })

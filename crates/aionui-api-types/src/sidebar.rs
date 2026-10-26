@@ -94,7 +94,12 @@ pub enum SidebarScope {
 pub enum SidebarItem {
     /// A conversation row, reusing the shared conversation DTO. Its `pinned`
     /// flag is derived from `user_order` row existence, not any table column.
-    Conversation { conversation: ConversationResponse },
+    Conversation {
+        conversation: ConversationResponse,
+        /// Latest archive event in Unix milliseconds; absent for active rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived_at: Option<i64>,
+    },
     /// An aggregated team row (server-side aggregate; the frontend does not
     /// reconstruct it from member conversations).
     Team(SidebarTeamItem),
@@ -187,6 +192,9 @@ pub struct SidebarTeamItem {
     pub name: String,
     /// `MAX(updated_at)` across active member conversations.
     pub updated_at: i64,
+    /// Latest archive event in Unix milliseconds; absent for active rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
     /// Derived from a `user_order` scene=`pinned` row existing for this team.
     pub pinned: bool,
     /// Active member conversation ids, `created_at` ascending.
