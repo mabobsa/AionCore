@@ -1,4 +1,7 @@
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 use aionui_ai_agent::{AgentError, IWorkerTaskManager};
 use aionui_api_types::{CreateConversationRequest, WebSocketMessage};
@@ -17,7 +20,15 @@ use serde_json::json;
 const OWNER: &str = "system_default_user";
 const THREAD: &str = "11111111-1111-4111-8111-111111111111";
 
-struct NoTasks(sqlx::SqlitePool);
+struct NoTasks {
+    pool: sqlx::SqlitePool,
+    hang_stop: AtomicBool,
+    stopped: Notify,
+    builds: AtomicUsize,
+    blocked_build: AtomicBool,
+    build_entered: Notify,
+    build_proceed: Notify,
+}
 #[async_trait::async_trait]
 impl IWorkerTaskManager for NoTasks {
     fn get_task(&self, _: &str) -> Option<aionui_ai_agent::AgentInstance> {
@@ -28,6 +39,11 @@ impl IWorkerTaskManager for NoTasks {
         _: &str,
         _: aionui_ai_agent::types::BuildTaskOptions,
     ) -> Result<aionui_ai_agent::AgentInstance, AgentError> {
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        self.build_entered.notify_one();
+        if self.blocked_build.load(Ordering::SeqCst) {
+            self.build_proceed.notified().await;
+        }
         Err(AgentError::internal("unused"))
     }
     fn kill(&self, _: &str, _: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -38,7 +54,11 @@ impl IWorkerTaskManager for NoTasks {
         id: &str,
         _: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let pool = self.0.clone();
+        self.stopped.notify_one();
+        if self.hang_stop.load(Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
+        }
+        let pool = self.pool.clone();
         let id = id.to_owned();
         Box::pin(async move {
             // Model the last binding emitted by a first turn while termination
@@ -83,6 +103,9 @@ struct Cleaner {
     pool: sqlx::SqlitePool,
     fail: bool,
     calls: Mutex<Vec<Vec<String>>>,
+    blocked: AtomicBool,
+    entered: Notify,
+    proceed: Notify,
 }
 #[async_trait::async_trait]
 impl NativeHistoryCleaner for Cleaner {
@@ -105,6 +128,10 @@ impl NativeHistoryCleaner for Cleaner {
             "both local rows must survive until native cleanup has succeeded"
         );
         self.calls.lock().unwrap().push(protected.to_vec());
+        self.entered.notify_one();
+        if self.blocked.load(Ordering::SeqCst) {
+            self.proceed.notified().await;
+        }
         if self.fail {
             return Err(ConversationError::Internal {
                 reason: "fixture native failure".into(),
@@ -125,6 +152,7 @@ struct Fixture {
     cleaner: Arc<Cleaner>,
     events: Arc<Events>,
     directory: tempfile::TempDir,
+    tasks: Arc<NoTasks>,
 }
 
 impl Fixture {
@@ -137,12 +165,24 @@ impl Fixture {
             pool: db.pool().clone(),
             fail,
             calls: Mutex::new(vec![]),
+            blocked: AtomicBool::new(false),
+            entered: Notify::new(),
+            proceed: Notify::new(),
+        });
+        let tasks = Arc::new(NoTasks {
+            pool: db.pool().clone(),
+            hang_stop: AtomicBool::new(false),
+            stopped: Notify::new(),
+            builds: AtomicUsize::new(0),
+            blocked_build: AtomicBool::new(false),
+            build_entered: Notify::new(),
+            build_proceed: Notify::new(),
         });
         let mut service = ConversationService::new(
             directory.path().into(),
             events.clone(),
             Arc::new(NoSkills),
-            Arc::new(NoTasks(db.pool().clone())),
+            tasks.clone(),
             Arc::new(SqliteConversationRepository::new(db.pool().clone())),
             Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone())),
             sessions.clone(),
@@ -157,6 +197,7 @@ impl Fixture {
             cleaner,
             events,
             directory,
+            tasks,
         }
     }
 
@@ -180,6 +221,129 @@ impl Fixture {
             .await
             .unwrap()
     }
+}
+
+fn start_delete(f: &Fixture, id: &str) -> tokio::task::JoinHandle<Result<(), ConversationError>> {
+    let service = f.service.clone();
+    let id = id.to_owned();
+    tokio::spawn(async move { service.delete(OWNER, &id).await })
+}
+
+#[tokio::test]
+async fn deletion_drains_a_warmup_already_building_before_stopping_the_agent() {
+    let f = Fixture::new(false, true).await;
+    let id = f.conversation("codex").await;
+    f.tasks.blocked_build.store(true, Ordering::SeqCst);
+    let service = f.service.clone();
+    let tasks: Arc<dyn IWorkerTaskManager> = f.tasks.clone();
+    let warmup_id = id.clone();
+    let warmup = tokio::spawn(async move { service.warmup(OWNER, &warmup_id, &tasks).await });
+    f.tasks.build_entered.notified().await;
+    let deletion = start_delete(&f, &id);
+    while !f.service.runtime_state().is_deleting(&id) {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), f.tasks.stopped.notified())
+            .await
+            .is_err()
+    );
+    f.tasks.build_proceed.notify_one();
+    assert!(matches!(warmup.await.unwrap(), Err(ConversationError::Internal { .. })));
+    deletion.await.unwrap().unwrap();
+    assert!(f.service.conversation_repo().get(OWNER, &id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn native_timeout_preserves_rows_and_allows_retry() {
+    let f = Fixture::new(false, true).await;
+    let id = f.conversation("codex").await;
+    f.cleaner.blocked.store(true, Ordering::SeqCst);
+    let deletion = start_delete(&f, &id);
+    f.cleaner.entered.notified().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(141)).await;
+    let error = deletion.await.unwrap().unwrap_err();
+    tokio::time::resume();
+    assert!(matches!(error, ConversationError::Timeout { reason } if reason.contains("native_history")));
+    assert_eq!(f.physical_session_count(&id).await, 1);
+    assert!(!f.service.runtime_state().is_deleting(&id));
+    f.cleaner.blocked.store(false, Ordering::SeqCst);
+    f.service.delete(OWNER, &id).await.unwrap();
+    assert!(f.service.conversation_repo().get(OWNER, &id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn stop_timeout_never_starts_history_cleanup() {
+    let f = Fixture::new(false, true).await;
+    let id = f.conversation("codex").await;
+    f.tasks.hang_stop.store(true, Ordering::SeqCst);
+    let deletion = start_delete(&f, &id);
+    f.tasks.stopped.notified().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let error = deletion.await.unwrap().unwrap_err();
+    tokio::time::resume();
+    assert!(matches!(error, ConversationError::Timeout { reason } if reason.contains("stop_agent")));
+    assert!(f.cleaner.calls.lock().unwrap().is_empty());
+    assert!(!f.service.runtime_state().is_deleting(&id));
+}
+
+#[tokio::test]
+async fn deleting_rejects_warmup_ensure_restart_and_duplicate_delete_after_turn_finishes() {
+    let f = Fixture::new(false, true).await;
+    let id = f.conversation("codex").await;
+    let state = f.service.runtime_state();
+    let mut turn = state.try_claim_turn(&id, "turn").unwrap();
+    f.cleaner.blocked.store(true, Ordering::SeqCst);
+    let deletion = start_delete(&f, &id);
+    f.cleaner.entered.notified().await;
+    assert!(turn.release());
+    let tasks: Arc<dyn IWorkerTaskManager> = f.tasks.clone();
+    assert!(matches!(
+        f.service.warmup(OWNER, &id, &tasks).await,
+        Err(ConversationError::Busy { .. })
+    ));
+    assert!(matches!(
+        f.service.ensure_runtime(OWNER, &id, &tasks).await,
+        Err(ConversationError::Busy { .. })
+    ));
+    assert!(matches!(
+        f.service.restart_runtime(OWNER, &id, &tasks).await,
+        Err(ConversationError::Busy { .. })
+    ));
+    assert!(matches!(
+        f.service.delete(OWNER, &id).await,
+        Err(ConversationError::Busy { .. })
+    ));
+    assert_eq!(f.tasks.builds.load(Ordering::SeqCst), 0);
+    f.cleaner.proceed.notify_one();
+    deletion.await.unwrap().unwrap();
+    assert!(!state.is_deleting(&id));
+}
+
+#[tokio::test]
+async fn waiting_for_another_delete_times_out_without_clearing_its_flag() {
+    let f = Fixture::new(false, true).await;
+    let first = f.conversation("codex").await;
+    let second = f.conversation("codex").await;
+    f.cleaner.blocked.store(true, Ordering::SeqCst);
+    let deletion = start_delete(&f, &first);
+    f.cleaner.entered.notified().await;
+    let waiting = start_delete(&f, &second);
+    while !f.service.runtime_state().is_deleting(&second) {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let error = waiting.await.unwrap().unwrap_err();
+    tokio::time::resume();
+    assert!(matches!(error, ConversationError::Timeout { reason } if reason.contains("history_lock")));
+    assert!(!f.service.runtime_state().is_deleting(&second));
+    assert!(f.service.runtime_state().is_deleting(&first));
+    deletion.abort();
+    assert!(deletion.await.unwrap_err().is_cancelled());
+    assert!(!f.service.runtime_state().is_deleting(&first));
 }
 
 #[tokio::test]

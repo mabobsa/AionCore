@@ -99,6 +99,36 @@ impl ConversationTurnOrchestrator {
     }
 
     async fn run_attempt(&self, input: TurnAttemptInput) -> Result<TurnAttemptResult, ConversationTurnResult> {
+        let runtime_state = self.service.runtime_state();
+        let preparation = runtime_state.begin_runtime_preparation(&input.conv_id).map_err(|error| {
+            warn!(conversation_id = %input.conv_id, code = error.error_code(), "Runtime build rejected before turn attempt");
+            ConversationTurnResult { status: ConversationTurnStatus::Interrupted, error_message: None, resume_required: false }
+        })?;
+        // A queued attempt may outlive deletion. Re-read after acquiring the
+        // preparation guard instead of building from its stale conversation row.
+        match self
+            .service
+            .conversation_repo()
+            .get_active(&input.user_id, &input.conv_id)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(aionui_db::DbError::Archived(_)) => {
+                return Err(ConversationTurnResult {
+                    status: ConversationTurnStatus::Interrupted,
+                    error_message: None,
+                    resume_required: false,
+                });
+            }
+            Err(_) => {
+                warn!(conversation_id = %input.conv_id, "Conversation lookup failed before runtime build");
+                return Err(ConversationTurnResult {
+                    status: ConversationTurnStatus::Failed,
+                    error_message: Some("Could not verify the conversation before starting its agent".into()),
+                    resume_required: false,
+                });
+            }
+        }
         let build_started_at = now_ms();
         let availability_agent_id = availability_agent_id(&input.build_options);
         let backend = acp_backend_from_build_options(&input.build_options).map(str::to_owned);
@@ -233,7 +263,14 @@ impl ConversationTurnOrchestrator {
             .ensure_background_watcher(&input.user_id, &input.conv_id, &agent);
 
         let persistence = self.service.runtime_persistence();
-        let runtime_state = self.service.runtime_state();
+        drop(preparation);
+        if runtime_state.is_deleting(&input.conv_id) {
+            return Err(ConversationTurnResult {
+                status: ConversationTurnStatus::Interrupted,
+                error_message: None,
+                resume_required: false,
+            });
+        }
 
         // A cancel may have arrived while the task was still being built, when
         // there was no agent to hand it to (see `ConversationService::cancel`).

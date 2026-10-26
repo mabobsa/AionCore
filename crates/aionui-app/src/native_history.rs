@@ -263,9 +263,15 @@ async fn delete_native_thread(
     protected: &[String],
 ) -> Result<NativeHistoryOutcome, ConversationError> {
     let mut rpc = Rpc::spawn(metadata)?;
+    let mut phase = "initialize";
+    tracing::info!("Native history helper started");
     let result = tokio::time::timeout(Duration::from_secs(120), async {
         rpc.initialize().await?;
+        phase = "list_threads";
+        tracing::info!(phase, "Native history cleanup stage started");
         let mut threads = rpc.list_threads().await?;
+        phase = "read_references";
+        tracing::info!(phase, "Native history cleanup stage started");
         let root = rpc.read_thread(thread_id).await?;
         // Lists can omit persisted empty chats. Read retained anchors absent
         // from the list and their ancestry before authorizing a recursive delete.
@@ -312,6 +318,8 @@ async fn delete_native_thread(
         if has_protected_descendant(&threads, thread_id, protected) {
             return Ok(NativeHistoryOutcome::RetainedReference);
         }
+        phase = "delete_thread";
+        tracing::info!(phase, "Native history cleanup stage started");
         let reply = rpc
             .request_frame("thread/delete", json!({"threadId": thread_id}))
             .await?;
@@ -319,22 +327,75 @@ async fn delete_native_thread(
             return Ok(NativeHistoryOutcome::RetainedReference);
         }
         response_result("thread/delete", &reply)?;
+        phase = "verify_deletion";
+        tracing::info!(phase, "Native history cleanup stage started");
         if rpc.read_thread(thread_id).await?.is_some() {
             return Err(failure("thread is still present after deletion"));
         }
         Ok(NativeHistoryOutcome::Deleted)
     })
     .await
-    .unwrap_or_else(|_| Err(failure("history request timed out")));
-    if let Err(error) = aionui_runtime::kill_process_tree(&mut rpc.child).await {
-        tracing::warn!(error_kind = ?error.kind(), "Could not reap the Codex history helper");
+    .unwrap_or_else(|_| {
+        tracing::warn!(phase, "Native history request timed out");
+        Err(failure("history request timed out"))
+    });
+    tracing::info!(
+        phase,
+        succeeded = result.is_ok(),
+        "Native history request finished; stopping helper"
+    );
+    if let Err(error) = stop_history_helper(&mut rpc.child).await {
+        // Builder's kill-on-drop is also a fallback when our enclosing deletion
+        // deadline cancels this future before normal cleanup can finish.
+        let _ = rpc.child.start_kill();
+        return Err(error);
     }
+    tracing::info!("Native history helper stopped");
     result
+}
+
+async fn stop_history_helper(child: &mut Child) -> Result<(), ConversationError> {
+    match tokio::time::timeout(Duration::from_secs(10), aionui_runtime::kill_process_tree(child)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            if child.try_wait().is_ok_and(|status| status.is_some()) {
+                return Ok(());
+            }
+            tracing::warn!(error_kind = ?error.kind(), "Could not stop native history helper");
+            Err(failure("helper shutdown failed"))
+        }
+        Err(_) => {
+            tracing::warn!("Native history helper shutdown timed out");
+            Err(failure("helper shutdown timed out"))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn helper_shutdown_reaps_a_running_process() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = aionui_runtime::Builder::clean_cli("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = aionui_runtime::Builder::clean_cli("sleep");
+            command.arg("30");
+            command
+        };
+        let mut child = command.spawn().unwrap();
+        stop_history_helper(&mut child).await.unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+        // Reaping an already-exited helper must not turn successful cleanup
+        // into a failure just because taskkill no longer finds the process.
+        stop_history_helper(&mut child).await.unwrap();
+    }
 
     #[test]
     fn only_accepts_the_captured_scoped_fork_reference_guard() {

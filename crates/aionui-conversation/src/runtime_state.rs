@@ -2,6 +2,7 @@ mod background;
 #[cfg(test)]
 mod background_tests;
 mod database_maintenance;
+mod deletion;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -38,6 +39,7 @@ struct ConversationRuntimeState {
     background_turns: HashMap<String, String>,
     revision: u64,
     deleting_conversations: HashSet<String>,
+    runtime_preparations: HashMap<String, usize>,
     cancelling_conversations: HashSet<String>,
     restarting_conversations: HashSet<String>,
     /// Cancels that arrived before the turn's agent registered, keyed by
@@ -546,7 +548,7 @@ impl ConversationRuntimeStateService {
         pending_confirmations: usize,
         supports_midturn_delivery: bool,
     ) -> ConversationRuntimeSummary {
-        let (active_turn_id, cancel_turn_id, cancelling, restarting, revision) = self
+        let (active_turn_id, cancel_turn_id, cancelling, restarting, deleting, revision) = self
             .state
             .lock()
             .map(|state| {
@@ -566,10 +568,11 @@ impl ConversationRuntimeStateService {
                     },
                     state.cancelling_conversations.contains(conversation_id),
                     state.restarting_conversations.contains(conversation_id),
+                    state.deleting_conversations.contains(conversation_id),
                     state.revision,
                 )
             })
-            .unwrap_or((None, None, false, true, 0));
+            .unwrap_or((None, None, false, true, true, 0));
         let claimed = active_turn_id.is_some();
 
         let state = if restarting {
@@ -590,7 +593,7 @@ impl ConversationRuntimeStateService {
 
         ConversationRuntimeSummary {
             state,
-            can_send_message: !is_processing,
+            can_send_message: !is_processing && !deleting,
             has_task,
             task_status,
             is_processing,
@@ -628,7 +631,8 @@ impl ConversationRuntimeStateService {
                     return false;
                 }
 
-                let was_deleting = state.deleting_conversations.remove(conversation_id);
+                // The deletion operation owns this flag, not the turn it stops.
+                let was_deleting = state.deleting_conversations.contains(conversation_id);
                 state.cancelling_conversations.remove(conversation_id);
                 state.revision += 1;
                 info!(
@@ -832,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn release_clears_deleting_flag_for_active_turn() {
+    fn release_preserves_deleting_flag_until_cleanup_finishes() {
         let state = Arc::new(ConversationRuntimeStateService::default());
         let mut claim = state
             .try_claim_turn("conv-1", "turn-1")
@@ -843,7 +847,7 @@ mod tests {
 
         assert!(claim.release());
 
-        assert!(!state.is_deleting("conv-1"));
+        assert!(state.is_deleting("conv-1"));
     }
 
     #[test]

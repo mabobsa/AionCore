@@ -1,4 +1,5 @@
 mod conversation_list;
+mod deletion;
 mod external_report;
 mod mcp_reload;
 pub mod native_history;
@@ -2663,13 +2664,26 @@ impl ConversationService {
     /// Broadcasts `conversation.listChanged(deleted)`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
-        let _history_guard = self.native_history_gate.lock().await;
+        let progress = deletion::DeleteProgress::new(id);
         // Get existing to retrieve source for broadcast and verify ownership
-        let existing = self
-            .conversation_repo
-            .get(user_id, id)
-            .await?
-            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        let existing = progress
+            .run("load_conversation", 10, async {
+                self.conversation_repo
+                    .get(user_id, id)
+                    .await?
+                    .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })
+            })
+            .await?;
+        let _deleting = self.runtime_state.begin_delete(id)?;
+        let _history_guard = progress
+            .run("history_lock", 30, async { Ok(self.native_history_gate.lock().await) })
+            .await?;
+        progress
+            .run("runtime_preparations", 30, async {
+                self.runtime_state.wait_for_runtime_preparations(id).await;
+                Ok(())
+            })
+            .await?;
 
         let source: Option<ConversationSource> = existing
             .source
@@ -2682,7 +2696,12 @@ impl ConversationService {
         // fork. Checked BEFORE the row delete (`list_associated` reads the
         // source row). Fails closed: an error keeps the workspace.
         if auto_workspace_to_delete.is_some() {
-            match self.conversation_repo.list_associated(user_id, id).await {
+            match progress
+                .run("workspace_references", 10, async {
+                    Ok(self.conversation_repo.list_associated(user_id, id).await?)
+                })
+                .await
+            {
                 Ok(rows) if !rows.is_empty() => {
                     info!(
                         conversation_id = %id,
@@ -2703,78 +2722,89 @@ impl ConversationService {
             }
         }
 
-        let had_active_turn = self.runtime_state.mark_deleting(id);
-
         // Stop even a first turn whose native session has not been bound yet.
         // The cleanup helper must read the final anchor after provisioning stops.
-        if tokio::time::timeout(
-            Duration::from_secs(30),
-            self.task_manager
-                .kill_and_wait(id, Some(AgentKillReason::ConversationDeleted)),
-        )
-        .await
-        .is_err()
-        {
-            self.runtime_state.clear_deleting(id);
-            return Err(ConversationError::internal(
-                "Timed out stopping the conversation before history cleanup",
-            ));
-        }
-        if let Err(err) = self.delete_native_history(user_id, &existing).await {
-            self.runtime_state.clear_deleting(id);
-            return Err(err);
-        }
+        progress
+            .run("stop_agent", 30, async {
+                self.task_manager
+                    .kill_and_wait(id, Some(AgentKillReason::ConversationDeleted))
+                    .await;
+                Ok(())
+            })
+            .await?;
+        progress
+            .run("native_history", 140, self.delete_native_history(user_id, &existing))
+            .await?;
 
         // Snapshot the hook list under the read lock, then drop the guard
         // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
         // across `.await` would make this future non-`Send`.
         let hooks: Vec<Arc<dyn OnConversationDelete>> =
             self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
-        for hook in hooks {
-            hook.on_conversation_deleted(user_id, id).await;
-        }
+        progress
+            .run("delete_hooks", 10, async {
+                for hook in hooks {
+                    hook.on_conversation_deleted(user_id, id).await;
+                }
+                Ok(())
+            })
+            .await?;
 
         // Drop the skill view while the row still exists: nothing downstream
         // knows the (user, conversation) pair once it is gone, and a leaked view
         // then waits for the next startup sweep.
-        self.skill_resolver.remove_skill_view(user_id, id).await;
-
-        if let Err(err) = self.conversation_repo.delete(user_id, id).await {
-            self.runtime_state.clear_deleting(id);
-            return Err(err.into());
-        }
-        if !had_active_turn {
-            self.runtime_state.clear_deleting(id);
-        }
+        progress
+            .run("skill_view", 10, async {
+                self.skill_resolver.remove_skill_view(user_id, id).await;
+                Ok(())
+            })
+            .await?;
+        progress
+            .run("database", 10, async {
+                Ok(self.conversation_repo.delete(user_id, id).await?)
+            })
+            .await?;
+        // Publish the committed deletion before optional filesystem cleanup.
+        self.broadcast_list_changed(user_id, id, "deleted", source.as_ref());
         // The repository atomically removes the session anchor with its parent.
         if let Some(workspace) = auto_workspace_to_delete {
-            let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
-                Ok(()) => {
-                    info!(
-                        conversation_id = %id,
-                        workspace = %workspace.display(),
-                        "Deleted auto-provisioned conversation workspace"
-                    );
-                    true
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                Err(err) => {
-                    warn!(
-                        conversation_id = %id,
-                        workspace = %workspace.display(),
-                        error = %err,
-                        "Failed to delete auto-provisioned conversation workspace"
-                    );
-                    false
-                }
-            };
-            if workspace_removed {
-                cleanup_empty_date_workspace_parents(&self.workspace_root, &workspace).await;
+            let cleanup = progress
+                .run("workspace_cleanup", 10, async {
+                    let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
+                        Ok(()) => {
+                            info!(
+                                conversation_id = %id,
+                                workspace = %workspace.display(),
+                                "Deleted auto-provisioned conversation workspace"
+                            );
+                            true
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(err) => {
+                            warn!(
+                                conversation_id = %id,
+                                workspace = %workspace.display(),
+                                error = %err,
+                                "Failed to delete auto-provisioned conversation workspace"
+                            );
+                            false
+                        }
+                    };
+                    if workspace_removed {
+                        cleanup_empty_date_workspace_parents(&self.workspace_root, &workspace).await;
+                    }
+                    Ok(())
+                })
+                .await;
+            if cleanup.is_err() {
+                warn!(
+                    conversation_id = id,
+                    "Conversation deleted; optional workspace cleanup did not finish"
+                );
             }
         }
 
         info!("Conversation deleted");
-        self.broadcast_list_changed(user_id, id, "deleted", source.as_ref());
 
         Ok(())
     }
@@ -5003,6 +5033,9 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
         phase: &'static str,
     ) -> Result<(AgentInstance, bool), ConversationError> {
+        // Hold a successful guard across the lookup, but validate ownership
+        // before exposing a busy/deleting error to the caller.
+        let preparation = self.runtime_state.begin_runtime_preparation(conversation_id);
         let row = self
             .conversation_repo
             .get_active(user_id, conversation_id)
@@ -5011,6 +5044,7 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
+        let _preparation = preparation?;
         reject_deprecated_runtime_row(&row)?;
 
         if let Some(agent) = task_manager.get_task(conversation_id) {
