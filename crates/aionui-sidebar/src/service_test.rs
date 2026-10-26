@@ -14,6 +14,7 @@ use aionui_db::{
     SqliteSidebarStore, SqliteUserOrderStore, init_database_memory,
 };
 use aionui_project::canonical;
+use aionui_realtime::BroadcastEventBus;
 use async_trait::async_trait;
 use tempfile::TempDir;
 
@@ -23,12 +24,16 @@ use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
 const USER: &str = "user-1";
 const OTHER: &str = "user-2";
 
+#[path = "service_archive_events_test.rs"]
+mod archive_events;
+
 // -- Fixture -----------------------------------------------------------------
 
 struct Fixture {
     db: Database,
     _tmp: TempDir,
     service: SidebarService,
+    event_bus: Arc<BroadcastEventBus>,
 }
 
 impl Fixture {
@@ -58,8 +63,14 @@ async fn fixture() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let sidebar: Arc<dyn ISidebarStore> = Arc::new(SqliteSidebarStore::new(db.pool().clone()));
     let user_order: Arc<dyn IUserOrderStore> = Arc::new(SqliteUserOrderStore::new(db.pool().clone()));
-    let service = SidebarService::new(sidebar, user_order, tmp.path().to_path_buf());
-    Fixture { db, _tmp: tmp, service }
+    let event_bus = Arc::new(BroadcastEventBus::new(16));
+    let service = SidebarService::new(sidebar, user_order, tmp.path().to_path_buf(), event_bus.clone());
+    Fixture {
+        db,
+        _tmp: tmp,
+        service,
+        event_bus,
+    }
 }
 
 // -- Seed helpers (raw SQL; mirrors sqlite_sidebar_test.rs) -------------------

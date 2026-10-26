@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use aionui_api_types::{
     ArchiveDeleteResult, ConversationResponse, MoveOrderRequest, OrderItemRefDto, RemoveProjectItem,
     RemoveProjectItemKind, RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse,
-    SidebarScope, SidebarTeamItem,
+    SidebarScope, SidebarTeamItem, WebSocketMessage,
 };
 use aionui_common::now_ms;
 use aionui_conversation::{is_temp_session_workspace, row_to_response_with_extra};
@@ -30,6 +30,7 @@ use aionui_db::{
     SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
 };
 use aionui_project::canonical;
+use aionui_realtime::EventBroadcaster;
 
 use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
 use aionui_db::fork_extensions::archive_retention_repository::IArchiveRetentionRepository;
@@ -52,6 +53,7 @@ pub struct SidebarService {
     archive_mutation: tokio::sync::Mutex<()>,
     sidebar: Arc<dyn ISidebarStore>,
     user_order: Arc<dyn IUserOrderStore>,
+    broadcaster: Arc<dyn EventBroadcaster>,
     /// Backend-managed data dir (conversation workspace root). Used both to
     /// detect temp workspaces (classification) and as the hydration `data_dir`.
     work_dir: PathBuf,
@@ -67,12 +69,18 @@ pub struct SidebarService {
 }
 
 impl SidebarService {
-    pub fn new(sidebar: Arc<dyn ISidebarStore>, user_order: Arc<dyn IUserOrderStore>, work_dir: PathBuf) -> Self {
+    pub fn new(
+        sidebar: Arc<dyn ISidebarStore>,
+        user_order: Arc<dyn IUserOrderStore>,
+        work_dir: PathBuf,
+        broadcaster: Arc<dyn EventBroadcaster>,
+    ) -> Self {
         Self {
             archive_retention: OnceLock::new(),
             archive_mutation: tokio::sync::Mutex::new(()),
             sidebar,
             user_order,
+            broadcaster,
             work_dir,
             remove_project_ports: Arc::new(OnceLock::new()),
             archive_teardown_ports: Arc::new(OnceLock::new()),
@@ -127,6 +135,9 @@ impl SidebarService {
         {
             return Err(SidebarError::ScopeGone);
         }
+        // Refresh every connected client as soon as the slice change commits,
+        // without waiting for potentially slow agent teardown.
+        self.broadcast_conversation_archive_changed(user_id, id, true);
         // The archive flip is now committed; release the agent process the same
         // way delete does (best-effort — the row already moved slice).
         self.stop_conversation_best_effort(user_id, id).await;
@@ -141,7 +152,28 @@ impl SidebarService {
         if !self.sidebar.set_conversation_archived(user_id, id, None).await? {
             return Err(SidebarError::ScopeGone);
         }
+        self.broadcast_conversation_archive_changed(user_id, id, false);
         Ok(())
+    }
+
+    fn broadcast_conversation_archive_changed(&self, user_id: &str, id: &str, archived: bool) {
+        // Reuse the existing list invalidation contract; archiving is an update,
+        // not deletion. user_id scopes delivery to the owner's clients.
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "conversation.listChanged",
+            serde_json::json!({
+                "user_id": user_id,
+                "conversation_id": id,
+                "action": "updated",
+                "source": null,
+            }),
+        ));
+        tracing::info!(
+            user_id,
+            conversation_id = id,
+            archived,
+            "conversation archive state committed; list refresh broadcast"
+        );
     }
 
     /// Archive a team. The store cascades the flip to the team's member

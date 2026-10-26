@@ -132,6 +132,7 @@ async fn fixture() -> Fixture {
         Arc::new(SqliteSidebarStore::new(db.pool().clone())),
         Arc::new(SqliteUserOrderStore::new(db.pool().clone())),
         tmp.path().into(),
+        Arc::new(aionui_realtime::BroadcastEventBus::new(16)),
     ));
     let repository = Arc::new(SqliteArchiveRetentionRepository::new(db.pool().clone()));
     let ports = Arc::new(DeletionPorts {
@@ -282,6 +283,7 @@ async fn archive_retention_catches_up_once_and_continues_after_item_failure() {
         Arc::new(SqliteSidebarStore::new(f.db.pool().clone())),
         Arc::new(SqliteUserOrderStore::new(f.db.pool().clone())),
         f._tmp.path().into(),
+        Arc::new(aionui_realtime::BroadcastEventBus::new(16)),
     );
     restarted.set_archive_retention_repository(f.repository.clone());
     restarted.set_remove_project_ports(f.ports.clone());

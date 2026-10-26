@@ -8,6 +8,7 @@ aionui-api-types.workspace = true
 aionui-auth.workspace = true
 aionui-common.workspace = true
 aionui-db.workspace = true
+aionui-realtime.workspace = true
 # Read-model reuse: row_to_response_with_extra (hydration) + is_temp_session_workspace
 # (temp-path classification, same predicate the write side uses).
 aionui-conversation.workspace = true

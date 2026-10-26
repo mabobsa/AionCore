@@ -401,6 +401,116 @@ async fn t4_1_scoped_event_reaches_only_matching_user() {
 }
 
 #[tokio::test]
+async fn archive_http_requests_refresh_owner_clients_and_restore_the_list() {
+    let app = start_app().await;
+    let owner = sign_token(&app, "archive-owner").await;
+    let other = sign_token(&app, "archive-other").await;
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+         VALUES ('archive-target', 'archive-owner', 'archive test', 'acp', '{}', 1, 1)",
+    )
+    .execute(app.services.database.pool())
+    .await
+    .unwrap();
+
+    let (_owner_tx, mut owner_rx) = connect_bearer(app.addr, &owner).await;
+    let (_second_tx, mut second_rx) = connect_bearer(app.addr, &owner).await;
+    let (_other_tx, mut other_rx) = connect_bearer(app.addr, &other).await;
+    wait_for_clients(&app, 3).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("http://{}", app.addr);
+    let csrf = "archive-event-test";
+
+    for operation in ["archive", "unarchive"] {
+        let url = format!("{base}/api/sidebar/conversation/archive-target/{operation}");
+
+        // Rejected requests must leave the data and all subscribed screens untouched.
+        let unauthenticated = client
+            .post(&url)
+            .header("x-csrf-token", csrf)
+            .header("cookie", format!("aionui-csrf-token={csrf}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), 401);
+        assert_eq!(unauthenticated.json::<Value>().await.unwrap()["code"], "UNAUTHORIZED");
+
+        let missing_csrf = client.post(&url).bearer_auth(&owner).send().await.unwrap();
+        assert_eq!(missing_csrf.status(), 403);
+        assert_eq!(missing_csrf.json::<Value>().await.unwrap()["code"], "CSRF_INVALID");
+
+        for (id, token) in [("archive-target", &other), ("missing", &owner)] {
+            let rejected = client
+                .post(format!("{base}/api/sidebar/conversation/{id}/{operation}"))
+                .bearer_auth(token)
+                .header("x-csrf-token", csrf)
+                .header("cookie", format!("aionui-csrf-token={csrf}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), 404);
+            assert_eq!(rejected.json::<Value>().await.unwrap()["code"], "sidebar_scope_gone");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), owner_rx.next())
+                .await
+                .is_err()
+        );
+
+        // This request is external to both owner windows, just like MnP's request.
+        let response = client
+            .post(&url)
+            .bearer_auth(&owner)
+            .header("x-csrf-token", csrf)
+            .header("cookie", format!("aionui-csrf-token={csrf}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        for event in [read_text(&mut owner_rx).await, read_text(&mut second_rx).await] {
+            assert_eq!(event["name"], "conversation.listChanged");
+            assert_eq!(
+                event["data"],
+                json!({
+                    "user_id": "archive-owner", "conversation_id": "archive-target",
+                    "action": "updated", "source": null,
+                })
+            );
+        }
+
+        // Follow the same refetch as AionUi's existing listChanged listener.
+        let list = client
+            .get(format!("{base}/api/conversations?limit=10"))
+            .bearer_auth(&owner)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list.status(), 200);
+        let body = list.json::<Value>().await.unwrap();
+        let ids: Vec<_> = body["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect();
+        if operation == "archive" {
+            assert!(ids.is_empty(), "the archived conversation must disappear on refetch");
+        } else {
+            assert_eq!(ids, vec!["archive-target"], "restore must reappear on refetch");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), other_rx.next())
+                .await
+                .is_err(),
+            "another user must not receive the archive notification"
+        );
+    }
+}
+
+#[tokio::test]
 async fn t4_1_unscoped_business_event_is_dropped_by_bridge() {
     let app = start_app().await;
     let token = sign_token(&app, "user-a").await;
