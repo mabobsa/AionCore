@@ -506,6 +506,14 @@ impl AgentInstance {
         }
     }
 
+    /// Mark direct-CLI usage unconfirmed before dispatching a new turn.
+    pub async fn prepare_turn_usage(&self, turn_id: &str) -> Result<(), AgentError> {
+        if let Self::Session(task) = self {
+            task.prepare_turn_usage(turn_id).await?;
+        }
+        Ok(())
+    }
+
     /// Wait for late direct-CLI usage persistence after the display terminal.
     pub async fn drain_turn_usage(&self) {
         if let Self::Session(task) = self {

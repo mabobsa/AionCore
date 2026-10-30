@@ -417,7 +417,11 @@ impl ConversationTurnOrchestrator {
             let (send_error_tx, send_error_rx) = oneshot::channel();
 
             tokio::spawn(async move {
-                if let Err(e) = send_agent.send_message(current_send).await {
+                let sent = match send_agent.prepare_turn_usage(&turn_id_for_send).await {
+                    Ok(()) => send_agent.send_message(current_send).await,
+                    Err(error) => Err(AgentSendError::from_agent_error(error)),
+                };
+                if let Err(e) = sent {
                     let failure_message = send_error_display_message(&e);
                     record_agent_session_failure(
                         &feedback_service,

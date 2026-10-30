@@ -24,7 +24,9 @@ use tokio::sync::broadcast;
 use crate::agent_task::IAgentTask;
 use crate::capability::live_tool_output::{LIVE_TOOL_OUTPUT_PREVIEW_BYTES, LiveToolOutputBuffer};
 use crate::error::AgentError;
-use crate::persistence::turn_usage::{TurnUsageDrain, UsageDrainOutcome};
+use crate::persistence::turn_usage::{
+    TurnUsageDrain, USAGE_DEADLINE, USAGE_WARNING_AFTER, UsageDrainOutcome, merge_freshness,
+};
 use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
 use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
@@ -82,6 +84,8 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
 struct SessionRuntime {
     tx: broadcast::Sender<AgentStreamEvent>,
     usage_drain: TurnUsageDrain,
+    usage_update_lock: tokio::sync::Mutex<()>,
+    usage_broadcaster: Option<Arc<dyn EventBroadcaster>>,
     last_activity_ms: AtomicI64,
     /// Live (declared, not yet terminal) background containers — the pump's
     /// `workflow_cards` ledger size, mirrored here so the idle scanner can see
@@ -521,6 +525,8 @@ impl SessionAgentTask {
         let runtime = Arc::new(SessionRuntime {
             tx,
             usage_drain: TurnUsageDrain::default(),
+            usage_update_lock: tokio::sync::Mutex::new(()),
+            usage_broadcaster: broadcaster.clone(),
             last_activity_ms: AtomicI64::new(now_ms()),
             live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
             status: std::sync::Mutex::new(None),
@@ -1479,6 +1485,7 @@ impl IAgentTask for SessionAgentTask {
                 AgentKillReason::UserCancelTimeout
                     | AgentKillReason::RuntimeRestart
                     | AgentKillReason::ConversationDeleted
+                    | AgentKillReason::Archived
             )
         ) {
             tracing::info!(
@@ -1489,6 +1496,7 @@ impl IAgentTask for SessionAgentTask {
             // 1) clean converge FIRST: relay breaks → orchestrator releases the turn
             //    claim → `cancelling` cleared → gate recovers (no red crash card).
             self.runtime.emit_finish_once();
+            self.runtime.usage_drain.close();
             // 2) then real process teardown, fire-and-forget on this sync entry
             //    (the awaitable variant is `kill_and_wait`).
             let backend = self.backend.clone();
@@ -1508,21 +1516,101 @@ impl IAgentTask for SessionAgentTask {
 }
 
 impl SessionAgentTask {
+    /// Persist the current turn's uncertainty before allowing the CLI to run.
+    pub async fn prepare_turn_usage(&self, turn_id: &str) -> Result<(), AgentError> {
+        let _guard = self.runtime.usage_update_lock.lock().await;
+        self.runtime.usage_drain.begin(turn_id);
+        self.persist_usage_status("pending", None).await
+    }
+
+    /// Caller serializes with the event pump through usage_update_lock.
+    async fn persist_usage_status(&self, status: &str, reason: Option<&str>) -> Result<(), AgentError> {
+        let (Some(repo), Some(turn_id)) = (self.session_repo.as_ref(), self.runtime.usage_drain.turn_id()) else {
+            return Ok(());
+        };
+        let state = repo
+            .load_runtime_state_for_user(&self.user_id, &self.conversation_id)
+            .await
+            .map_err(|e| AgentError::internal(format!("Failed to load usage freshness: {e}")))?;
+        let mut usage = state
+            .and_then(|s| s.context_usage_json)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        merge_freshness(&mut usage, &turn_id, status, reason);
+        if !save_context_usage(repo.as_ref(), &self.user_id, &self.conversation_id, &usage).await {
+            return Err(AgentError::internal("Failed to persist usage freshness"));
+        }
+        if let Some(bus) = self.runtime.usage_broadcaster.as_ref() {
+            broadcast_usage_snapshot(
+                bus.as_ref(),
+                &self.conversation_id,
+                &self.user_id,
+                serde_json::json!(usage),
+            );
+        }
+        Ok(())
+    }
+
     /// Drain the final usage report before a turn releases its runtime/claim.
     /// The streaming Finish remains immediate. A missing result cannot hang
     /// teardown indefinitely; log the reason without manufacturing a reading.
     pub async fn drain_turn_usage(&self) {
-        let started = std::time::Instant::now();
-        let outcome = self.runtime.usage_drain.wait(std::time::Duration::from_secs(10)).await;
+        let started = tokio::time::Instant::now();
+        let mut outcome = self.runtime.usage_drain.wait(USAGE_WARNING_AFTER).await;
+        if outcome == UsageDrainOutcome::TimedOut {
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                turn_id = ?self.runtime.usage_drain.turn_id(),
+                elapsed_ms = started.elapsed().as_millis(),
+                deadline_ms = USAGE_DEADLINE.as_millis(),
+                "turn usage delayed; retaining runtime until final result or deadline"
+            );
+            outcome = self
+                .runtime
+                .usage_drain
+                .wait(USAGE_DEADLINE.saturating_sub(started.elapsed()))
+                .await;
+        }
+        // Serialize a deadline against the final DB write: a result that has
+        // already been saved wins; queued results after termination cannot leak
+        // into a subsequent turn's snapshot.
+        {
+            let _guard = self.runtime.usage_update_lock.lock().await;
+            if outcome == UsageDrainOutcome::TimedOut {
+                outcome = self.runtime.usage_drain.wait(std::time::Duration::ZERO).await;
+            }
+            let reason = match outcome {
+                UsageDrainOutcome::NotReported => Some("not_reported"),
+                UsageDrainOutcome::PersistenceFailed => Some("persistence_failed"),
+                UsageDrainOutcome::ProcessClosed => Some("process_closed"),
+                UsageDrainOutcome::TimedOut => Some("timed_out"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                if outcome == UsageDrainOutcome::TimedOut {
+                    self.runtime.usage_drain.freeze();
+                }
+                if let Err(err) = self.persist_usage_status("unavailable", Some(reason)).await {
+                    tracing::warn!(conversation_id = %self.conversation_id, error = %err, "usage freshness persistence failed");
+                }
+            }
+        }
+        if outcome == UsageDrainOutcome::TimedOut {
+            self.backend.terminate().await;
+            self.runtime.usage_drain.close();
+        }
         match outcome {
             UsageDrainOutcome::NotRequired => {}
             UsageDrainOutcome::Persisted => tracing::info!(
                 conversation_id = %self.conversation_id,
+                turn_id = ?self.runtime.usage_drain.turn_id(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "turn usage persisted before runtime release"
             ),
             other => tracing::warn!(
                 conversation_id = %self.conversation_id,
+                turn_id = ?self.runtime.usage_drain.turn_id(),
                 ?other,
                 elapsed_ms = started.elapsed().as_millis(),
                 "turn usage drain ended without a fresh persisted reading"
@@ -1549,6 +1637,7 @@ impl SessionAgentTask {
                 AgentKillReason::UserCancelTimeout
                     | AgentKillReason::RuntimeRestart
                     | AgentKillReason::ConversationDeleted
+                    | AgentKillReason::Archived
             )
         ) {
             tracing::info!(
@@ -1557,6 +1646,7 @@ impl SessionAgentTask {
                 "session kill_and_wait: emitted clean Finish and awaiting backend termination"
             );
             self.runtime.emit_finish_once(); // clean converge FIRST (sync)
+            self.runtime.usage_drain.close();
             let backend = self.backend.clone();
             Box::pin(async move { backend.terminate().await }) // then terminate
         } else {
@@ -2963,7 +3053,19 @@ fn spawn_event_pump(
                 }
             };
             runtime.touch();
+            let _usage_guard = if matches!(
+                env.event,
+                SessionEvent::UsageDelta { .. } | SessionEvent::AdapterSpecific { .. } | SessionEvent::Detached { .. }
+            ) {
+                Some(runtime.usage_update_lock.lock().await)
+            } else {
+                None
+            };
             runtime.usage_drain.observe(&env);
+            if informative_usage(&env.event).is_some() && !runtime.usage_drain.accepts_usage(env.turn_gen) {
+                tracing::debug!(conv_id = %conversation_id, generation = env.turn_gen, "ignoring usage from a superseded or terminated turn");
+                continue;
+            }
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
 
             if env.turn_gen > last_seen_turn_gen {
@@ -3472,10 +3574,23 @@ fn spawn_event_pump(
             // Persist the Tier-2 side-effects the legacy ACP path wrote via
             // AcpSessionSyncService (which this direct-CLI path bypasses). Best-effort:
             // a repo error is warn-logged, never fatal to the stream.
+            let mut saved_usage = None;
             if let Some(repo) = session_repo.as_ref() {
-                let saved = persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
                 if informative_usage(&env.event).is_some() {
-                    runtime.usage_drain.record_write(env.turn_gen, saved);
+                    saved_usage = persist_context_usage_snapshot(
+                        repo.as_ref(),
+                        &user_id,
+                        &conversation_id,
+                        &env.event,
+                        runtime.usage_drain.turn_id().as_deref(),
+                    )
+                    .await;
+                    runtime.usage_drain.record_write(env.turn_gen, saved_usage.is_some());
+                    if saved_usage.is_some() {
+                        tracing::info!(conversation_id, turn_id = ?runtime.usage_drain.turn_id(), generation = env.turn_gen, "context usage snapshot persisted");
+                    }
+                } else {
+                    persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
                 }
             }
             // Usage must ALSO reach the live view directly. claude reports it on the
@@ -3487,7 +3602,11 @@ fn spawn_event_pump(
                 broadcaster.as_ref(),
                 informative_usage(&env.event).is_some() || claude_rate_limit_info(&env.event).is_some(),
             ) {
-                broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
+                if let Some(usage) = saved_usage {
+                    broadcast_usage_snapshot(bus.as_ref(), &conversation_id, &user_id, usage);
+                } else {
+                    broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
+                }
             }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
@@ -3795,6 +3914,21 @@ fn broadcast_usage_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user
     bus.broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
 }
 
+fn broadcast_usage_snapshot(
+    bus: &dyn EventBroadcaster,
+    conversation_id: &str,
+    user_id: &str,
+    usage: serde_json::Value,
+) {
+    bus.broadcast(aionui_api_types::WebSocketMessage::new(
+        "message.stream",
+        serde_json::json!({
+            "conversation_id": conversation_id, "user_id": user_id, "msg_id": "", "turn_id": "",
+            "type": "acp_context_usage", "data": usage, "hidden": false,
+        }),
+    ));
+}
+
 /// Merge one usage report into `acp_session.session_config.runtime.context_usage`.
 ///
 /// Shape is the ACP `UsageUpdate` the frontend already consumes:
@@ -3810,6 +3944,18 @@ async fn persist_context_usage(
     conversation_id: &str,
     event: &SessionEvent,
 ) -> bool {
+    persist_context_usage_snapshot(repo, user_id, conversation_id, event, None)
+        .await
+        .is_some()
+}
+
+async fn persist_context_usage_snapshot(
+    repo: &dyn IAcpSessionRepository,
+    user_id: &str,
+    conversation_id: &str,
+    event: &SessionEvent,
+    turn_id: Option<&str>,
+) -> Option<serde_json::Value> {
     let SessionEvent::UsageDelta {
         input_tokens,
         output_tokens,
@@ -3819,7 +3965,7 @@ async fn persist_context_usage(
         breakdown,
     } = event
     else {
-        return false;
+        return None;
     };
     let (used, cost_usd, context_window) = (*used, *cost_usd, *context_window);
     let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
@@ -3832,7 +3978,7 @@ async fn persist_context_usage(
         Ok(None) => serde_json::Map::new(),
         Err(err) => {
             tracing::warn!(conversation_id, error = %err, "session-sync: load_runtime_state failed; skipping usage persist");
-            return false;
+            return None;
         }
     };
     usage.insert("used".into(), serde_json::json!(used));
@@ -3864,7 +4010,12 @@ async fn persist_context_usage(
             meta.insert("thought_tokens".into(), serde_json::json!(breakdown.thought_tokens));
         }
     }
-    save_context_usage(repo, user_id, conversation_id, &usage).await
+    if let Some(turn_id) = turn_id {
+        merge_freshness(&mut usage, turn_id, "current", None);
+    }
+    save_context_usage(repo, user_id, conversation_id, &usage)
+        .await
+        .then(|| serde_json::json!(usage))
 }
 
 async fn persist_claude_rate_limit(
@@ -3913,14 +4064,20 @@ async fn save_context_usage(
         context_usage_json: Some(Some(&json)),
         ..Default::default()
     };
-    if let Err(err) = repo
+    match repo
         .save_runtime_state_for_user(user_id, conversation_id, &params)
         .await
     {
-        tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
-        return false;
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(conversation_id, "session-sync: usage row missing; nothing persisted");
+            false
+        }
+        Err(err) => {
+            tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
+            false
+        }
     }
-    true
 }
 
 /// Extract the picked option id from the confirm `data` payload. The frontend sends
@@ -6456,6 +6613,35 @@ mod persist_tests {
             .unwrap()
             .expect("runtime state exists");
         serde_json::from_str(state.context_usage_json.as_deref().expect("context_usage written")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_usage_row_is_not_reported_as_a_successful_write() {
+        let (repo, db) = seeded_repo().await;
+        sqlx::query("DELETE FROM acp_session WHERE conversation_id = 'conv-1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(!persist_context_usage(repo.as_ref(), "user-1", "conv-1", &usage(42, None, Some(100))).await);
+    }
+
+    #[tokio::test]
+    async fn fresh_usage_and_confirmation_are_saved_in_the_same_snapshot() {
+        let (repo, _db) = seeded_repo().await;
+        let saved = persist_context_usage_snapshot(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(42, Some(0.5), Some(100)),
+            Some("turn-fresh"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_usage(repo.as_ref()).await, saved);
+        assert_eq!(saved["used"], 42);
+        assert_eq!(saved["size"], 100);
+        assert_eq!(saved["_meta"]["aionui/contextUsage"]["turn_id"], "turn-fresh");
+        assert_eq!(saved["_meta"]["aionui/contextUsage"]["status"], "current");
     }
 
     /// Defect 1: claude reports usage on the `result` frame, which lands AFTER the
@@ -10879,6 +11065,28 @@ mod force_kill_tests {
         let again = next_terminal(&mut rx).await;
         assert!(again.is_none(), "no second Finish broadcast, got {again:?}");
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+    }
+
+    #[tokio::test]
+    async fn archive_terminates_and_closes_pending_usage_without_waiting_for_deadline() {
+        let (task, counter) = build_task_with_counter();
+        start_turn(task.as_ref()).await;
+        task.runtime.usage_drain.begin("archived-turn");
+        task.runtime.usage_drain.observe(&SessionEnvelope {
+            session_id: "conv-1".into(),
+            turn_gen: 1,
+            event: SessionEvent::AdapterSpecific {
+                tag: "_claude/usage_pending".into(),
+                payload: serde_json::Value::Null,
+            },
+        });
+        AgentInstance::Session(task.clone())
+            .kill_and_wait(Some(AgentKillReason::Archived))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_millis(200), task.drain_turn_usage())
+            .await
+            .expect("archive must not retain the turn for two minutes");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -403,6 +403,15 @@ const CHOICE_NOTICE_HEADER: &str = "[AionUi choice notifications]";
 
 #[tokio::test]
 async fn leased_headless_turn_persists_late_usage_before_cleanup_and_cold_restore() {
+    check_leased_usage_drain(&[Some(10_300), Some(30_000)]).await;
+}
+
+#[tokio::test]
+async fn leased_headless_usage_deadline_preserves_previous_reading_and_next_turn_recovers() {
+    check_leased_usage_drain(&[Some(100), None, Some(100)]).await;
+}
+
+async fn check_leased_usage_drain(result_delays_ms: &[Option<u64>]) {
     use aionui_db::{IAcpSessionRepository, SaveRuntimeStateParams, SqliteAcpSessionRepository};
     use aionui_session::{ClaudeSessionBackend, testing::FakeAgentIo};
 
@@ -456,7 +465,7 @@ async fn leased_headless_turn_persists_late_usage_before_cleanup_and_cold_restor
         .unwrap();
     let result = frames.iter().find(|v| v["type"] == "result").unwrap();
 
-    for attempt in 0..2 {
+    for (attempt, delay) in result_delays_ms.iter().enumerate() {
         let initial = format!(
             "{}\n{}\n{}\n",
             json!({"type":"system","subtype":"init","session_id":"native-usage","model":"claude-fable-5"}),
@@ -469,15 +478,20 @@ async fn leased_headless_turn_persists_late_usage_before_cleanup_and_cold_restor
         let release = fake.segment_releaser();
         let stdin = fake.captured_stdin();
         let backend = Arc::new(ClaudeSessionBackend::build_with_io(&conv.id, Box::new(fake)).await);
-        let task = aionui_ai_agent::session_agent::SessionAgentTask::new(
+        let task = aionui_ai_agent::session_agent::SessionAgentTask::new_with_preload(
             AgentType::Acp,
             conv.id.clone(),
             "user_1".into(),
             workspace.path().to_string_lossy().into(),
             backend,
             Some(sessions.clone()),
+            &Default::default(),
+            None,
+            Some(events.clone()),
         );
-        tasks.insert_agent(&conv.id, AgentInstance::Session(task));
+        // Retain an external Arc even after cleanup; a hard deadline must really
+        // abort the reader, not merely remove the runtime from the manager.
+        tasks.insert_agent(&conv.id, AgentInstance::Session(task.clone()));
         let operation = format!("usage-drain-{attempt}");
         let request = serde_json::from_value(json!({
             "operationId": operation, "actorConversationId": conv.id, "targetConversationId": conv.id,
@@ -511,11 +525,24 @@ async fn leased_headless_turn_persists_late_usage_before_cleanup_and_cold_restor
         })
         .await
         .expect("early display Finish");
-        // Hold the result back beyond the old 22–53ms teardown window.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Let the relay enter its drain before advancing only Tokio's clock.
+        // SQLite runs on real worker threads, so resume time before DB polling.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(delay.unwrap_or(10_300))).await;
+        tokio::time::resume();
         assert_eq!(tasks.kill_count(), attempt, "must retain runtime for late usage");
-        assert_eq!(svc.get_usage("user_1", &conv.id).await.unwrap(), previous);
-        release();
+        let pending = svc.get_usage("user_1", &conv.id).await.unwrap().unwrap();
+        assert_eq!(pending["_meta"]["aionui/contextUsage"]["status"], "pending");
+        assert_eq!(pending["used"], previous.as_ref().unwrap()["used"]);
+        if delay.is_some() {
+            release();
+        } else {
+            // The first advance crossed the warning; this crosses the hard cap.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(120)).await;
+            tokio::time::resume();
+        }
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let state = dispatcher.status(&operation).await.unwrap().unwrap();
@@ -534,6 +561,39 @@ async fn leased_headless_turn_persists_late_usage_before_cleanup_and_cold_restor
         .expect("dispatch completes after usage persistence");
         assert!(tasks.get_task(&conv.id).is_none(), "leased runtime is released");
         let usage = svc.get_usage("user_1", &conv.id).await.unwrap().unwrap();
+        let freshness = &usage["_meta"]["aionui/contextUsage"];
+        let streamed = events
+            .take_events()
+            .into_iter()
+            .find(|e| e.name == "message.stream" && e.data["type"] == "acp_context_usage" && e.data["data"] == usage);
+        assert!(
+            streamed.is_some(),
+            "live UI and cold GET /usage must receive the identical confirmed snapshot"
+        );
+        let dispatch = dispatcher.status(&operation).await.unwrap().unwrap();
+        assert_eq!(freshness["turn_id"].as_str(), dispatch.turn_id.as_deref());
+        if delay.is_none() {
+            assert_eq!(freshness["status"], "unavailable");
+            assert_eq!(freshness["reason"], "timed_out");
+            let previous = previous.as_ref().unwrap();
+            assert_eq!(usage["used"], previous["used"]);
+            assert_eq!(usage["size"], previous["size"]);
+            assert_eq!(usage["cost"], previous["cost"]);
+            assert_eq!(
+                freshness["updated_at"],
+                previous["_meta"]["aionui/contextUsage"]["updated_at"]
+            );
+            release();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                svc.get_usage("user_1", &conv.id).await.unwrap().unwrap(),
+                usage,
+                "a queued result from the terminated reader cannot revive an old reading"
+            );
+            continue;
+        }
+        assert_eq!(freshness["status"], "current");
+        assert!(freshness["updated_at"].as_i64().is_some());
         assert_eq!(
             usage["used"], 27_237,
             "last API call occupancy, not aggregate billed tokens"
