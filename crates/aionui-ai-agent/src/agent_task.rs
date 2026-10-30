@@ -506,6 +506,13 @@ impl AgentInstance {
         }
     }
 
+    /// Wait for late direct-CLI usage persistence after the display terminal.
+    pub async fn drain_turn_usage(&self) {
+        if let Self::Session(task) = self {
+            task.drain_turn_usage().await;
+        }
+    }
+
     /// Slash commands available in the current session. Only ACP exposes
     /// a slash-command catalog; other variants report an empty list
     /// (the UI renders "no commands").

@@ -458,6 +458,10 @@ impl ConversationTurnOrchestrator {
             });
 
             let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+            // Claude's display Finish can precede result/usage. Keep this task
+            // and the turn claim alive until its persistence pump drains them,
+            // before a continuation or leased headless teardown can take over.
+            agent.drain_turn_usage().await;
             aggregate_summary.merge(&outcome.attempt);
 
             if let Some(session_key) = agent.get_session_key() {

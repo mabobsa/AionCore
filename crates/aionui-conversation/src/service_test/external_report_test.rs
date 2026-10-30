@@ -401,6 +401,148 @@ impl IMockAgent for PromptCaptureAgent {}
 
 const CHOICE_NOTICE_HEADER: &str = "[AionUi choice notifications]";
 
+#[tokio::test]
+async fn leased_headless_turn_persists_late_usage_before_cleanup_and_cold_restore() {
+    use aionui_db::{IAcpSessionRepository, SaveRuntimeStateParams, SqliteAcpSessionRepository};
+    use aionui_session::{ClaudeSessionBackend, testing::FakeAgentIo};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+    let sessions = Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
+    let events = Arc::new(MockBroadcaster::new());
+    let tasks = Arc::new(MockTaskManager::new());
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        events.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        tasks.clone(),
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        sessions.clone(),
+    );
+    let mut create = make_create_req_with_backend("claude");
+    create.extra["workspace"] = json!(workspace.path());
+    let conv = svc.create("user_1", create).await.unwrap();
+    sessions
+        .save_runtime_state_for_user(
+            "user_1",
+            &conv.id,
+            &SaveRuntimeStateParams {
+                context_usage_json: Some(Some(r#"{"_meta":{"_claude/rateLimit":{"status":"allowed"}}}"#)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let dispatcher = crate::external_dispatch::ExternalConversationDispatchService::new(
+        svc.clone(),
+        Arc::new(aionui_db::fork_extensions::SqliteExternalDispatchRepository::new(
+            db.pool().clone(),
+        )),
+    );
+
+    // Real captured terminal frames, split exactly across the early Finish/result
+    // gap. This must exercise the CLI reader, pump, relay, dispatch and DB together.
+    let fixture = include_str!("../../../aionui-session/tests/fixtures/claude_2.1.220_background_bash_turn.ndjsonl");
+    let frames: Vec<serde_json::Value> = fixture
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let terminal = frames
+        .iter()
+        .find(|v| v["event"]["delta"]["stop_reason"] == "end_turn")
+        .unwrap();
+    let result = frames.iter().find(|v| v["type"] == "result").unwrap();
+
+    for attempt in 0..2 {
+        let initial = format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"system","subtype":"init","session_id":"native-usage","model":"claude-fable-5"}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}),
+            terminal,
+        )
+        .into_bytes();
+        let fake =
+            FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![initial, format!("{result}\n").into_bytes()]);
+        let release = fake.segment_releaser();
+        let stdin = fake.captured_stdin();
+        let backend = Arc::new(ClaudeSessionBackend::build_with_io(&conv.id, Box::new(fake)).await);
+        let task = aionui_ai_agent::session_agent::SessionAgentTask::new(
+            AgentType::Acp,
+            conv.id.clone(),
+            "user_1".into(),
+            workspace.path().to_string_lossy().into(),
+            backend,
+            Some(sessions.clone()),
+        );
+        tasks.insert_agent(&conv.id, AgentInstance::Session(task));
+        let operation = format!("usage-drain-{attempt}");
+        let request = serde_json::from_value(json!({
+            "operationId": operation, "actorConversationId": conv.id, "targetConversationId": conv.id,
+            "strategy":"resume", "instruction":"usage regression",
+            "workspaceLease": {"workspaceId":"usage-test","projectRoot":workspace.path(),"jobId":"job","leaseId":"lease"},
+        })).unwrap();
+        let previous = svc.get_usage("user_1", &conv.id).await.unwrap();
+        dispatcher.dispatch(request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if String::from_utf8_lossy(&stdin.lock().await).contains("\"type\":\"user\"") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("prompt dispatched");
+        release();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if events
+                    .take_events()
+                    .iter()
+                    .any(|e| e.name == "message.stream" && e.data["type"] == "finish")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("early display Finish");
+        // Hold the result back beyond the old 22–53ms teardown window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(tasks.kill_count(), attempt, "must retain runtime for late usage");
+        assert_eq!(svc.get_usage("user_1", &conv.id).await.unwrap(), previous);
+        release();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = dispatcher.status(&operation).await.unwrap().unwrap();
+                if state.state == aionui_api_types::ExternalConversationDispatchState::Completed {
+                    break;
+                }
+                assert_ne!(
+                    state.state,
+                    aionui_api_types::ExternalConversationDispatchState::Failed,
+                    "{state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dispatch completes after usage persistence");
+        assert!(tasks.get_task(&conv.id).is_none(), "leased runtime is released");
+        let usage = svc.get_usage("user_1", &conv.id).await.unwrap().unwrap();
+        assert_eq!(
+            usage["used"], 27_237,
+            "last API call occupancy, not aggregate billed tokens"
+        );
+        assert_eq!(usage["size"], 1_000_000);
+        assert_eq!(usage["_meta"]["_claude/rateLimit"]["status"], "allowed");
+    }
+}
+
 /// Dispatches one MindNProgress-shaped request into a capture agent, then runs a
 /// plain user turn in the same target conversation, and returns both prompts.
 async fn dispatch_then_user_turn(

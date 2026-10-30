@@ -24,6 +24,7 @@ use tokio::sync::broadcast;
 use crate::agent_task::IAgentTask;
 use crate::capability::live_tool_output::{LIVE_TOOL_OUTPUT_PREVIEW_BYTES, LiveToolOutputBuffer};
 use crate::error::AgentError;
+use crate::persistence::turn_usage::{TurnUsageDrain, UsageDrainOutcome};
 use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
 use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
@@ -80,6 +81,7 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
 /// the translator writes and `subscribe()` reads, plus liveness bookkeeping.
 struct SessionRuntime {
     tx: broadcast::Sender<AgentStreamEvent>,
+    usage_drain: TurnUsageDrain,
     last_activity_ms: AtomicI64,
     /// Live (declared, not yet terminal) background containers — the pump's
     /// `workflow_cards` ledger size, mirrored here so the idle scanner can see
@@ -518,6 +520,7 @@ impl SessionAgentTask {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
             tx,
+            usage_drain: TurnUsageDrain::default(),
             last_activity_ms: AtomicI64::new(now_ms()),
             live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
             status: std::sync::Mutex::new(None),
@@ -1505,6 +1508,28 @@ impl IAgentTask for SessionAgentTask {
 }
 
 impl SessionAgentTask {
+    /// Drain the final usage report before a turn releases its runtime/claim.
+    /// The streaming Finish remains immediate. A missing result cannot hang
+    /// teardown indefinitely; log the reason without manufacturing a reading.
+    pub async fn drain_turn_usage(&self) {
+        let started = std::time::Instant::now();
+        let outcome = self.runtime.usage_drain.wait(std::time::Duration::from_secs(10)).await;
+        match outcome {
+            UsageDrainOutcome::NotRequired => {}
+            UsageDrainOutcome::Persisted => tracing::info!(
+                conversation_id = %self.conversation_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "turn usage persisted before runtime release"
+            ),
+            other => tracing::warn!(
+                conversation_id = %self.conversation_id,
+                ?other,
+                elapsed_ms = started.elapsed().as_millis(),
+                "turn usage drain ended without a fresh persisted reading"
+            ),
+        }
+    }
+
     /// Awaitable force-kill (aligns with `AcpAgentManager::kill_and_wait`): the
     /// awaitable teardown entry the `UserCancel` watchdog uses. For a
     /// force-kill it emits the clean `Finish` synchronously FIRST
@@ -2938,6 +2963,7 @@ fn spawn_event_pump(
                 }
             };
             runtime.touch();
+            runtime.usage_drain.observe(&env);
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
 
             if env.turn_gen > last_seen_turn_gen {
@@ -3447,7 +3473,10 @@ fn spawn_event_pump(
             // AcpSessionSyncService (which this direct-CLI path bypasses). Best-effort:
             // a repo error is warn-logged, never fatal to the stream.
             if let Some(repo) = session_repo.as_ref() {
-                persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
+                let saved = persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
+                if informative_usage(&env.event).is_some() {
+                    runtime.usage_drain.record_write(env.turn_gen, saved);
+                }
             }
             // Usage must ALSO reach the live view directly. claude reports it on the
             // `result` frame, which lands after the relay has already broken on
@@ -3547,6 +3576,7 @@ fn spawn_event_pump(
             }
         }
 
+        runtime.usage_drain.close();
         // The event stream ended: the backend (and its process group) is being
         // torn down. Settle every card still open and push the frames NOW —
         // the out-of-turn watcher is still subscribed at this instant and drains
@@ -3609,7 +3639,7 @@ async fn persist_side_effects(
     user_id: &str,
     conversation_id: &str,
     event: &SessionEvent,
-) {
+) -> bool {
     // Self-heal a dead resume anchor: a turn that failed *because* the stored
     // backend session id no longer resolves must null that id, or every subsequent
     // send re-resumes the same dead session and the conversation wedges forever.
@@ -3663,12 +3693,15 @@ async fn persist_side_effects(
         // AFTER the relay has already broken on Finish.
         _ => {}
     }
-    if let Some(usage) = informative_usage(event) {
-        persist_context_usage(repo, user_id, conversation_id, usage).await;
-    }
+    let usage_saved = if let Some(usage) = informative_usage(event) {
+        persist_context_usage(repo, user_id, conversation_id, usage).await
+    } else {
+        false
+    };
     if let Some(rate_limit) = claude_rate_limit_info(event) {
         persist_claude_rate_limit(repo, user_id, conversation_id, rate_limit).await;
     }
+    usage_saved
 }
 
 fn claude_rate_limit_info(event: &SessionEvent) -> Option<&serde_json::Value> {
@@ -3776,7 +3809,7 @@ async fn persist_context_usage(
     user_id: &str,
     conversation_id: &str,
     event: &SessionEvent,
-) {
+) -> bool {
     let SessionEvent::UsageDelta {
         input_tokens,
         output_tokens,
@@ -3786,7 +3819,7 @@ async fn persist_context_usage(
         breakdown,
     } = event
     else {
-        return;
+        return false;
     };
     let (used, cost_usd, context_window) = (*used, *cost_usd, *context_window);
     let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
@@ -3799,7 +3832,7 @@ async fn persist_context_usage(
         Ok(None) => serde_json::Map::new(),
         Err(err) => {
             tracing::warn!(conversation_id, error = %err, "session-sync: load_runtime_state failed; skipping usage persist");
-            return;
+            return false;
         }
     };
     usage.insert("used".into(), serde_json::json!(used));
@@ -3831,7 +3864,7 @@ async fn persist_context_usage(
             meta.insert("thought_tokens".into(), serde_json::json!(breakdown.thought_tokens));
         }
     }
-    save_context_usage(repo, user_id, conversation_id, &usage).await;
+    save_context_usage(repo, user_id, conversation_id, &usage).await
 }
 
 async fn persist_claude_rate_limit(
@@ -3868,12 +3901,12 @@ async fn save_context_usage(
     user_id: &str,
     conversation_id: &str,
     usage: &serde_json::Map<String, serde_json::Value>,
-) {
+) -> bool {
     let json = match serde_json::to_string(&usage) {
         Ok(j) => j,
         Err(err) => {
             tracing::warn!(conversation_id, error = %err, "session-sync: encode context_usage failed");
-            return;
+            return false;
         }
     };
     let params = SaveRuntimeStateParams {
@@ -3885,7 +3918,9 @@ async fn save_context_usage(
         .await
     {
         tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
+        return false;
     }
+    true
 }
 
 /// Extract the picked option id from the confirm `data` payload. The frontend sends

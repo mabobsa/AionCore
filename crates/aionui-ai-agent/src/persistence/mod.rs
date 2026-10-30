@@ -6,5 +6,6 @@
 //! `acp_session.session_config.runtime` row.
 
 pub mod acp_session_sync;
+pub(crate) mod turn_usage;
 
 pub use acp_session_sync::AcpSessionSyncService;

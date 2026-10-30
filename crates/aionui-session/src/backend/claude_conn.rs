@@ -1859,9 +1859,10 @@ async fn reader_task(
                 // Bug-A: a TurnResult is stamped with the OPEN turn's locked epoch
                 // (set at this turn's system/init), NOT the read-time turn_gen — so a
                 // late result from a turn superseded by a proactive resend keeps its
-                // own (older) epoch and the reducer's cross-turn guard drops it. All
-                // OTHER events keep the read-time epoch (they belong to the live turn
-                // and carry no cross-turn staleness). turn_open_epoch==0 (no init yet)
+                // own (older) epoch and the reducer's cross-turn guard drops it.
+                // UsageDelta receives the same locked epoch below so persistence
+                // can acknowledge the matching turn. Other events keep the read-time
+                // epoch. turn_open_epoch==0 (no init yet)
                 // falls back to cur_gen (first-frames / no regression). The
                 // orchestrator's restamp_epoch then propagates this into
                 // TurnResult.epoch (it copies env.turn_gen when the adapter left 0).
@@ -1870,10 +1871,46 @@ async fn reader_task(
                 } else {
                     cur_gen
                 };
+                // The streaming terminal precedes the result's usage (recorded in
+                // fixtures/claude_2.1.220_background_bash_turn.ndjsonl). Let the
+                // persistence consumer hold teardown until that result is drained.
+                if matches!(ev, SessionEvent::TurnResult { .. }) {
+                    let _ = event_tx.send(SessionEnvelope {
+                        session_id: session_id.clone(),
+                        turn_gen: env_gen,
+                        event: SessionEvent::AdapterSpecific {
+                            tag: "_claude/usage_pending".into(),
+                            payload: serde_json::Value::Null,
+                        },
+                    });
+                }
+                let env_gen = if matches!(ev, SessionEvent::UsageDelta { .. }) && turn_open_epoch != 0 {
+                    turn_open_epoch
+                } else {
+                    env_gen
+                };
                 let _ = event_tx.send(SessionEnvelope {
                     session_id: session_id.clone(),
                     turn_gen: env_gen,
                     event: ev,
+                });
+            }
+            if raw
+                .as_ref()
+                .and_then(|v| v.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("result")
+            {
+                // Sent AFTER every UsageDelta, including absent/zero usage on an
+                // error or compact result. FIFO consumption acknowledges the DB
+                // write, not merely receipt of the result by the stdout reader.
+                let _ = event_tx.send(SessionEnvelope {
+                    session_id: session_id.clone(),
+                    turn_gen: if turn_open_epoch == 0 { cur_gen } else { turn_open_epoch },
+                    event: SessionEvent::AdapterSpecific {
+                        tag: "_claude/usage_complete".into(),
+                        payload: serde_json::Value::Null,
+                    },
                 });
             }
         }
@@ -4858,6 +4895,11 @@ mod tests {
                     SessionEvent::PromptAccepted { .. }
                     | SessionEvent::BackendBound { .. }
                     | SessionEvent::SubagentUpdate { .. } => continue,
+                    SessionEvent::AdapterSpecific { ref tag, .. }
+                        if tag == "_claude/usage_pending" || tag == "_claude/usage_complete" =>
+                    {
+                        continue;
+                    }
                     ev => new_events.push(ev),
                 },
                 _ => break,
@@ -4924,6 +4966,11 @@ mod tests {
                     | SessionEvent::BackendBound { .. }
                     | SessionEvent::ConfigChanged { .. }
                     | SessionEvent::SubagentUpdate { .. } => continue,
+                    SessionEvent::AdapterSpecific { ref tag, .. }
+                        if tag == "_claude/usage_pending" || tag == "_claude/usage_complete" =>
+                    {
+                        continue;
+                    }
                     ev => new_events.push(ev),
                 },
                 _ => break,
