@@ -190,7 +190,7 @@ impl ConversationService {
         Ok(())
     }
 
-    /// Resolve the current model and reasoning effort without starting a new
+    /// Resolve the current model, mode and reasoning effort without starting a new
     /// agent process. Active runtime values win; missing or failed runtime
     /// values fall back to the durable ACP session snapshot and then the
     /// conversation's creation snapshot for legacy rows.
@@ -235,11 +235,13 @@ impl ConversationService {
         };
 
         let runtime_model = runtime_option_value(&runtime_options, "model", &["model"]);
+        let runtime_mode = runtime_option_value(&runtime_options, "mode", &["mode"]);
         let runtime_thought_level = runtime_option_value(&runtime_options, "thought_level", &THOUGHT_LEVEL_IDS);
 
-        if runtime_model.is_some() && runtime_thought_level.is_some() {
+        if runtime_model.is_some() && runtime_mode.is_some() && runtime_thought_level.is_some() {
             return Ok(ConversationRuntimeConfigResponse {
                 model: resolved_config_value(runtime_model, None),
+                mode: resolved_config_value(runtime_mode, None),
                 thought_level: resolved_config_value(runtime_thought_level, None),
                 has_active_runtime,
             });
@@ -262,6 +264,23 @@ impl ConversationService {
         };
         let conversation_extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
 
+        let snapshot_mode = persisted_state
+            .as_ref()
+            .and_then(|state| non_empty_value(state.current_mode_id.as_deref()))
+            .or_else(|| {
+                non_empty_value(
+                    conversation_extra
+                        .get("current_mode_id")
+                        .and_then(serde_json::Value::as_str),
+                )
+            })
+            .or_else(|| {
+                non_empty_value(
+                    conversation_extra
+                        .get("session_mode")
+                        .and_then(serde_json::Value::as_str),
+                )
+            });
         let snapshot_model = persisted_state
             .as_ref()
             .and_then(|state| non_empty_value(state.current_model_id.as_deref()))
@@ -291,6 +310,7 @@ impl ConversationService {
 
         Ok(ConversationRuntimeConfigResponse {
             model: resolved_config_value(runtime_model, snapshot_model),
+            mode: resolved_config_value(runtime_mode, snapshot_mode),
             thought_level: resolved_config_value(runtime_thought_level, snapshot_thought_level),
             has_active_runtime,
         })

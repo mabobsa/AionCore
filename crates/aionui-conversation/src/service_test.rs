@@ -5083,6 +5083,7 @@ async fn get_runtime_config_prefers_active_values_over_persisted_snapshot() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let runtime_state = PersistedSessionState {
         current_model_id: Some("snapshot-model".to_owned()),
+        current_mode_id: Some("snapshot-mode".to_owned()),
         config_selections_json: Some(r#"{"effort":"low"}"#.to_owned()),
         ..Default::default()
     };
@@ -5090,6 +5091,16 @@ async fn get_runtime_config_prefers_active_values_over_persisted_snapshot() {
         make_service_with_mock_task_manager_and_runtime_state(task_mgr.clone(), runtime_state);
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let agent = MockAgent::new(&conv.id).with_config_options(vec![
+        AcpConfigOptionDto {
+            id: "mode".to_owned(),
+            name: Some("Mode".to_owned()),
+            label: None,
+            description: None,
+            category: Some("mode".to_owned()),
+            option_type: "select".to_owned(),
+            current_value: Some("runtime-mode".to_owned()),
+            options: Vec::new(),
+        },
         AcpConfigOptionDto {
             id: "model".to_owned(),
             name: Some("Model".to_owned()),
@@ -5116,6 +5127,8 @@ async fn get_runtime_config_prefers_active_values_over_persisted_snapshot() {
     let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
 
     assert_eq!(result.model.value.as_deref(), Some("runtime-model"));
+    assert_eq!(result.mode.value.as_deref(), Some("runtime-mode"));
+    assert_eq!(result.mode.source, ConversationRuntimeConfigSource::Runtime);
     assert_eq!(result.thought_level.value.as_deref(), Some("xhigh"));
     assert!(result.has_active_runtime);
     assert_eq!(result.model.source, ConversationRuntimeConfigSource::Runtime);
@@ -5127,6 +5140,7 @@ async fn get_runtime_config_falls_back_to_snapshot_when_active_query_fails() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let runtime_state = PersistedSessionState {
         current_model_id: Some("snapshot-model".to_owned()),
+        current_mode_id: Some("snapshot-mode".to_owned()),
         config_selections_json: Some(r#"{"reasoning_effort":"high"}"#.to_owned()),
         ..Default::default()
     };
@@ -5140,6 +5154,8 @@ async fn get_runtime_config_falls_back_to_snapshot_when_active_query_fails() {
 
     let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
 
+    assert_eq!(result.mode.value.as_deref(), Some("snapshot-mode"));
+    assert_eq!(result.mode.source, ConversationRuntimeConfigSource::Snapshot);
     assert_eq!(result.model.value.as_deref(), Some("snapshot-model"));
     assert_eq!(result.thought_level.value.as_deref(), Some("high"));
     assert!(result.has_active_runtime);
@@ -5152,6 +5168,7 @@ async fn get_runtime_config_falls_back_when_active_query_times_out() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let runtime_state = PersistedSessionState {
         current_model_id: Some("snapshot-model".to_owned()),
+        current_mode_id: Some("snapshot-mode".to_owned()),
         config_selections_json: Some(r#"{"effort":"xhigh"}"#.to_owned()),
         ..Default::default()
     };
@@ -5167,6 +5184,8 @@ async fn get_runtime_config_falls_back_when_active_query_times_out() {
 
     let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
 
+    assert_eq!(result.mode.value.as_deref(), Some("snapshot-mode"));
+    assert_eq!(result.mode.source, ConversationRuntimeConfigSource::Snapshot);
     assert_eq!(result.model.value.as_deref(), Some("snapshot-model"));
     assert_eq!(result.thought_level.value.as_deref(), Some("xhigh"));
     assert_eq!(result.model.source, ConversationRuntimeConfigSource::Snapshot);
@@ -5178,6 +5197,7 @@ async fn get_runtime_config_uses_snapshot_without_starting_runtime() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let runtime_state = PersistedSessionState {
         current_model_id: Some("snapshot-model".to_owned()),
+        current_mode_id: Some("snapshot-mode".to_owned()),
         config_selections_json: Some(r#"{"thought_level":"medium"}"#.to_owned()),
         ..Default::default()
     };
@@ -5186,11 +5206,56 @@ async fn get_runtime_config_uses_snapshot_without_starting_runtime() {
 
     let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
 
+    assert_eq!(result.mode.value.as_deref(), Some("snapshot-mode"));
+    assert_eq!(result.mode.source, ConversationRuntimeConfigSource::Snapshot);
     assert_eq!(result.model.value.as_deref(), Some("snapshot-model"));
     assert_eq!(result.thought_level.value.as_deref(), Some("medium"));
     assert!(!result.has_active_runtime);
     assert_eq!(result.model.source, ConversationRuntimeConfigSource::Snapshot);
     assert_eq!(result.thought_level.source, ConversationRuntimeConfigSource::Snapshot);
+}
+
+#[tokio::test]
+async fn get_runtime_config_keeps_missing_mode_unavailable_and_rejects_other_users() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
+    assert_eq!(result.mode.value, None);
+    assert_eq!(result.mode.source, ConversationRuntimeConfigSource::Unavailable);
+    assert!(matches!(
+        svc.get_runtime_config("user_2", &conv.id).await.unwrap_err(),
+        ConversationError::NotFound { id } if id == conv.id
+    ));
+}
+
+#[tokio::test]
+async fn get_runtime_config_mixes_active_model_with_persisted_mode() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let runtime_state = PersistedSessionState {
+        current_mode_id: Some("persisted-mode".to_owned()),
+        ..Default::default()
+    };
+    let (svc, _broadcaster, _repo) =
+        make_service_with_mock_task_manager_and_runtime_state(task_mgr.clone(), runtime_state);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
+        id: "model".to_owned(),
+        name: None,
+        label: None,
+        description: None,
+        category: Some("model".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some("active-model".to_owned()),
+        options: Vec::new(),
+    }]);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+    let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
+    assert_eq!(result.model.value.as_deref(), Some("active-model"));
+    assert_eq!(result.model.source, ConversationRuntimeConfigSource::Runtime);
+    assert_eq!(result.mode.value.as_deref(), Some("persisted-mode"));
+    assert_eq!(result.mode.source, ConversationRuntimeConfigSource::Snapshot);
 }
 
 #[tokio::test]

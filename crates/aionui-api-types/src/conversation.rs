@@ -309,10 +309,11 @@ pub struct ConversationRuntimeConfigValue {
     pub source: ConversationRuntimeConfigSource,
 }
 
-/// Read-only model and reasoning-effort view for an existing conversation.
+/// Read-only model, mode and reasoning-effort view for an existing conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationRuntimeConfigResponse {
     pub model: ConversationRuntimeConfigValue,
+    pub mode: ConversationRuntimeConfigValue,
     pub thought_level: ConversationRuntimeConfigValue,
     pub has_active_runtime: bool,
 }
