@@ -363,7 +363,23 @@ impl ClaudeAdapter {
                 // carries the system prompt and tools — the next turn measured
                 // 23_779, ~20k higher. Different baselines.
                 self.last_call_tokens = None;
-                vec![SessionEvent::Heartbeat]
+                // Verified: Claude Agent SDK TypeScript reference,
+                // SDKCompactBoundaryMessage (uuid, manual/auto boundary).
+                // Keep malformed/legacy boundaries as liveness only; inventing
+                // an ID here would double-count a replay after resume.
+                let mut events = vec![SessionEvent::Heartbeat];
+                if v.get("parent_tool_use_id").is_none_or(serde_json::Value::is_null)
+                    && let Some(id) = v
+                        .get("uuid")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                {
+                    events.push(SessionEvent::ContextCompacted {
+                        event_id: format!("claude:{id}"),
+                        completed_at_ms: None,
+                    });
+                }
+                events
             }
             // network backoff + the no-chunk compaction window both = liveness.
             "api_retry" | "compacting" => vec![SessionEvent::Heartbeat],
@@ -3178,6 +3194,32 @@ mod tests {
         assert!(
             matches!(no_subtype.as_slice(), [SessionEvent::AdapterSpecific { tag, .. }] if tag == "system/"),
             "absent subtype → opaque `system/` (no panic), got {no_subtype:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_completion_keeps_stable_identity_but_not_progress_or_child_boundaries() {
+        let mut adapter = ClaudeAdapter::new();
+        for trigger in ["manual", "auto"] {
+            let frame = serde_json::json!({
+                "type": "system", "subtype": "compact_boundary",
+                "uuid": "0a7cda3f-1d16-4a8b-a3d6-1d27ab21b3aa",
+                "compact_metadata": {"trigger": trigger, "pre_tokens": 27349}
+            });
+            assert_eq!(
+                adapter.parse_system(&frame)[1],
+                SessionEvent::ContextCompacted {
+                    event_id: "claude:0a7cda3f-1d16-4a8b-a3d6-1d27ab21b3aa".into(),
+                    completed_at_ms: None,
+                }
+            );
+            let mut child = frame.clone();
+            child["parent_tool_use_id"] = serde_json::json!("child-tool");
+            assert_eq!(adapter.parse_system(&child), vec![SessionEvent::Heartbeat]);
+        }
+        assert_eq!(
+            adapter.parse_system(&serde_json::json!({"subtype": "compacting", "uuid": "progress"})),
+            vec![SessionEvent::Heartbeat]
         );
     }
 

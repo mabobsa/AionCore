@@ -2301,6 +2301,18 @@ pub async fn build_session_instance(
         }
     }
 
+    if let Some(repo) = acp_session_repo.as_ref() {
+        crate::persistence::context_compaction::restore(
+            repo.as_ref(),
+            &user_id,
+            &conversation_id,
+            backend_label,
+            &spec,
+            &session_config,
+        )
+        .await;
+    }
+
     let backend = connection
         .open_session(spec, session_config)
         .await
@@ -3055,7 +3067,10 @@ fn spawn_event_pump(
             runtime.touch();
             let _usage_guard = if matches!(
                 env.event,
-                SessionEvent::UsageDelta { .. } | SessionEvent::AdapterSpecific { .. } | SessionEvent::Detached { .. }
+                SessionEvent::UsageDelta { .. }
+                    | SessionEvent::AdapterSpecific { .. }
+                    | SessionEvent::Detached { .. }
+                    | SessionEvent::ContextCompacted { .. }
             ) {
                 Some(runtime.usage_update_lock.lock().await)
             } else {
@@ -3589,6 +3604,19 @@ fn spawn_event_pump(
                     if saved_usage.is_some() {
                         tracing::info!(conversation_id, turn_id = ?runtime.usage_drain.turn_id(), generation = env.turn_gen, "context usage snapshot persisted");
                     }
+                } else if let SessionEvent::ContextCompacted {
+                    event_id,
+                    completed_at_ms,
+                } = &env.event
+                {
+                    saved_usage = crate::persistence::context_compaction::record(
+                        repo.as_ref(),
+                        &user_id,
+                        &conversation_id,
+                        event_id,
+                        *completed_at_ms,
+                    )
+                    .await;
                 } else {
                     persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
                 }
@@ -3600,7 +3628,9 @@ fn spawn_event_pump(
             // is what turns claude's indicator on without waiting for a reload.
             if let (Some(bus), true) = (
                 broadcaster.as_ref(),
-                informative_usage(&env.event).is_some() || claude_rate_limit_info(&env.event).is_some(),
+                informative_usage(&env.event).is_some()
+                    || claude_rate_limit_info(&env.event).is_some()
+                    || matches!(env.event, SessionEvent::ContextCompacted { .. }),
             ) {
                 if let Some(usage) = saved_usage {
                     broadcast_usage_snapshot(bus.as_ref(), &conversation_id, &user_id, usage);
@@ -6616,6 +6646,192 @@ mod persist_tests {
     }
 
     #[tokio::test]
+    async fn compaction_pump_persists_broadcasts_and_restores_without_positive_usage() {
+        use crate::persistence::context_compaction::META_KEY;
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<aionui_api_types::WebSocketMessage<serde_json::Value>>>);
+        impl EventBroadcaster for Recorder {
+            fn broadcast(&self, event: aionui_api_types::WebSocketMessage<serde_json::Value>) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let (repo, _db) = seeded_repo().await;
+        let bus = Arc::new(Recorder::default());
+        let event = SessionEvent::ContextCompacted {
+            event_id: "claude:stable-boundary".into(),
+            completed_at_ms: Some(1000),
+        };
+        let script = [event.clone(), usage(0, None, None), event]
+            .into_iter()
+            .map(|event| SessionEnvelope {
+                session_id: "conv-1".into(),
+                turn_gen: 1,
+                event,
+            })
+            .collect();
+        let task = SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            ".".into(),
+            Arc::new(super::pump_tests::ScriptBackend(script)),
+            Some(repo.clone()),
+            &Default::default(),
+            None,
+            Some(bus.clone()),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if !bus.0.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let saved = task.get_usage().await.unwrap().unwrap();
+        assert_eq!(saved["_meta"][META_KEY]["count"], 1);
+        assert!(saved.get("used").is_none(), "compaction must not fabricate occupancy");
+        let sent = bus.0.lock().unwrap();
+        assert_eq!(sent[0].data["type"], "acp_context_usage");
+        assert_eq!(sent[0].data["data"], saved);
+        drop(sent);
+        drop(task);
+        let reopened = SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            ".".into(),
+            Arc::new(super::pump_tests::ScriptBackend(Vec::new())),
+            Some(repo.clone()),
+            &Default::default(),
+            None,
+            None,
+        );
+        assert_eq!(reopened.get_usage().await.unwrap().unwrap(), saved);
+        assert!(
+            reopened
+                .session_repo
+                .as_ref()
+                .unwrap()
+                .load_runtime_state_for_user("other-user", "conv-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_restore_uses_native_account_history_without_erasing_usage() {
+        use crate::persistence::context_compaction::{META_KEY, record, restore};
+        let (repo, _db) = seeded_repo().await;
+        persist_context_usage(repo.as_ref(), "user-1", "conv-1", &usage(100, Some(0.5), Some(200))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("projects").join("workspace");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "5ac768c9-9a20-42b5-9720-784ba361feaf";
+        std::fs::write(project.join(format!("{sid}.jsonl")), r#"{"type":"system","subtype":"compact_boundary","uuid":"boundary-id","timestamp":"2026-10-30T00:02:34.090Z"}"#).unwrap();
+        let spec = aionui_session::SessionSpec::Resume {
+            session_id: "conv-1".into(),
+            backend_session_id: Some(sid.into()),
+        };
+        let config = aionui_session::SessionConfig {
+            spawn_env: vec![aionui_common::EnvVar {
+                name: "CLAUDE_CONFIG_DIR".into(),
+                value: dir.path().to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        let fork = aionui_session::SessionSpec::Fork {
+            session_id: "conv-1".into(),
+            parent_backend_session_id: sid.into(),
+            at_turn_id: Some("earlier-turn".into()),
+        };
+        restore(repo.as_ref(), "user-1", "conv-1", "claude", &fork, &config).await;
+        assert!(
+            stored_usage(repo.as_ref()).await["_meta"][META_KEY].is_null(),
+            "a fork must not inherit the parent's later compactions"
+        );
+        restore(repo.as_ref(), "user-1", "conv-1", "claude", &spec, &config).await;
+        assert!(
+            record(repo.as_ref(), "user-1", "conv-1", "claude:boundary-id", None)
+                .await
+                .is_none()
+        );
+        restore(repo.as_ref(), "user-1", "conv-1", "claude", &spec, &config).await;
+        let saved = stored_usage(repo.as_ref()).await;
+        assert_eq!(saved["_meta"][META_KEY]["count"], 1);
+        assert_eq!(saved["_meta"][META_KEY]["history_complete"], true);
+        assert_eq!((saved["used"].as_u64(), saved["size"].as_u64()), (Some(100), Some(200)));
+        assert_eq!(saved["cost"]["amount"], 0.5);
+    }
+
+    #[tokio::test]
+    async fn compaction_ledger_survives_usage_and_rate_limit_updates() {
+        use crate::persistence::context_compaction::{META_KEY, record};
+        let (repo, _db) = seeded_repo().await;
+        record(repo.as_ref(), "user-1", "conv-1", "codex:compaction", Some(1000))
+            .await
+            .unwrap();
+        let saved = stored_usage(repo.as_ref()).await["_meta"][META_KEY].clone();
+        persist_context_usage_snapshot(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(123, None, Some(200)),
+            Some("turn"),
+        )
+        .await
+        .unwrap();
+        persist_claude_rate_limit(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &serde_json::json!({"status":"allowed"}),
+        )
+        .await;
+        let after = stored_usage(repo.as_ref()).await;
+        assert_eq!(after["_meta"][META_KEY], saved);
+        assert_eq!(after["_meta"]["aionui/contextUsage"]["status"], "current");
+        assert_eq!(after["used"], 123);
+    }
+
+    #[tokio::test]
+    async fn compaction_missing_history_is_unknown_but_new_session_has_confirmed_zero() {
+        use crate::persistence::context_compaction::{META_KEY, restore};
+        let (repo, _db) = seeded_repo().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = aionui_session::SessionConfig {
+            spawn_env: vec![aionui_common::EnvVar {
+                name: "CODEX_HOME".into(),
+                value: dir.path().to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        let spec = aionui_session::SessionSpec::Resume {
+            session_id: "conv-1".into(),
+            backend_session_id: Some("01a167f0-3a5a-7533-a16a-afebdb06cf00".into()),
+        };
+        restore(repo.as_ref(), "user-1", "conv-1", "codex", &spec, &config).await;
+        assert!(
+            repo.load_runtime_state_for_user("user-1", "conv-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .context_usage_json
+                .is_none()
+        );
+        let fresh = aionui_session::SessionSpec::Fresh {
+            session_id: "conv-1".into(),
+        };
+        restore(repo.as_ref(), "user-1", "conv-1", "codex", &fresh, &config).await;
+        let saved = stored_usage(repo.as_ref()).await;
+        assert_eq!(saved["_meta"][META_KEY]["count"], 0);
+        assert_eq!(saved["_meta"][META_KEY]["history_complete"], true);
+    }
+
+    #[tokio::test]
     async fn missing_usage_row_is_not_reported_as_a_successful_write() {
         let (repo, db) = seeded_repo().await;
         sqlx::query("DELETE FROM acp_session WHERE conversation_id = 'conv-1'")
@@ -7474,7 +7690,7 @@ mod pump_tests {
     use futures_util::stream::BoxStream;
 
     /// Emits a fixed script on `events()`; `dispatch(Send)` admits a turn.
-    struct ScriptBackend(Vec<SessionEnvelope>);
+    pub(super) struct ScriptBackend(pub(super) Vec<SessionEnvelope>);
 
     #[async_trait::async_trait]
     impl SessionBackend for ScriptBackend {

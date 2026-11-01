@@ -146,6 +146,12 @@ pub enum SessionEvent {
     /// as an HONEST liveness/diagnostic signal — a future liveness consumer (e.g. a
     /// UI "still working" hint) can read it without re-introducing a deadline.
     Heartbeat,
+    /// A completed context compaction, identified by the backend's stable ID.
+    /// Informational only: never starts/finishes a turn or substitutes for usage.
+    ContextCompacted {
+        event_id: String,
+        completed_at_ms: Option<i64>,
+    },
     /// Terminal result. Routing is by `is_error` (C7/R10), NEVER by subtype
     /// (measured: error turns still carry subtype="success").
     TurnResult {
@@ -986,6 +992,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | AskResolved { .. }
         | PromptAccepted { .. }
         | UsageDelta { .. }
+        | ContextCompacted { .. }
         | Provisioning { .. }
         | Rewound { .. }
         | ConfigChanged { .. }
@@ -1046,6 +1053,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             | UserQuestion(..)
             | ToolResult { .. }
             | UsageDelta { .. }
+            | ContextCompacted { .. }
             | Provisioning { .. }
             | ConfigChanged { .. }
             // an out-of-turn advisory the user should keep seeing in history

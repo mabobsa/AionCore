@@ -451,6 +451,7 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // Addendum 9: BackendBound is a pure pass-through for the conversation
         // (persist backend_session_id). The reducer NEVER touches SessionState for
         // it — it is not a turn signal, not a requires-action, not a roster update.
+        | SessionEvent::ContextCompacted { .. }
         | SessionEvent::BackendBound { .. }
         // BackendTurnBound is BackendBound's turn-scoped sibling (fork anchor
         // pass-through for message stamping). Same contract: reducer no-op.

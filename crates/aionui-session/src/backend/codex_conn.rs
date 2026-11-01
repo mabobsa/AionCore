@@ -3239,6 +3239,16 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
     }
 
     match item_type {
+        // Verified: codex 0.164.0 generated ItemCompletedNotification schema.
+        // Only the completed edge counts; thread/compacted is its deprecated
+        // duplicate and item/started may never successfully finish.
+        "contextCompaction" if completed && !id.is_empty() => {
+            out.push(SessionEvent::ContextCompacted {
+                event_id: format!("codex:{id}"),
+                completed_at_ms: params.get("completedAtMs").and_then(Value::as_i64),
+            });
+        }
+        "contextCompaction" => {}
         "agentMessage" => {
             // A STREAMED agentMessage starts with `text:""` and arrives via
             // item/agentMessage/delta — for it the bracket is the whole signal.
@@ -4811,6 +4821,28 @@ impl Drop for CodexSessionBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compaction_only_counts_completed_items_with_stable_ids() {
+        let params = serde_json::json!({
+            "threadId": "thread", "turnId": "turn", "completedAtMs": 1792754159861_i64,
+            "item": {"type": "contextCompaction", "id": "01a16877-86ab-77f3-87f0-cc7b799a6354"}
+        });
+        assert!(super::map_item(&params, false).is_empty());
+        assert_eq!(
+            super::map_item(&params, true),
+            vec![crate::SessionEvent::ContextCompacted {
+                event_id: "codex:01a16877-86ab-77f3-87f0-cc7b799a6354".into(),
+                completed_at_ms: Some(1792754159861),
+            }]
+        );
+        assert!(
+            !super::map_notification("thread/compacted", &params)
+                .iter()
+                .any(|ev| matches!(ev, crate::SessionEvent::ContextCompacted { .. }))
+        );
+        assert!(super::map_item(&serde_json::json!({"item":{"type":"contextCompaction"}}), true).is_empty());
+    }
+
     use super::*;
     use crate::event::PermissionKind;
     use crate::testing::FakeAgentIo;
