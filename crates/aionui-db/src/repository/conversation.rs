@@ -309,14 +309,15 @@ pub trait IConversationRepository: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Full-text search across messages, joining conversation name.
+    /// Search a bounded range of messages, newest first. A cursor may be
+    /// returned even when the range contains no matches.
     async fn search_messages(
         &self,
         user_id: &str,
         keyword: &str,
-        page: u32,
+        cursor: Option<&MessagePageCursor>,
         page_size: u32,
-    ) -> Result<PaginatedResult<MessageSearchRow>, DbError>;
+    ) -> Result<MessageSearchResult, DbError>;
 
     /// Returns persisted conversation artifacts ordered by `created_at`.
     async fn list_artifacts(
@@ -536,4 +537,12 @@ pub struct MessageSearchRow {
     pub conversation_pinned_at: Option<TimestampMs>,
     pub conversation_created_at: TimestampMs,
     pub conversation_updated_at: TimestampMs,
+}
+
+/// Search progress without a full-history count. The cursor is the last
+/// inspected message, including non-matching rows, rather than the last hit.
+#[derive(Debug, Clone)]
+pub struct MessageSearchResult {
+    pub items: Vec<MessageSearchRow>,
+    pub next_cursor: Option<MessagePageCursor>,
 }

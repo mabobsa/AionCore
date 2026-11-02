@@ -25,7 +25,7 @@ use aionui_cron::{CronRouterState, cron_routes};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
-    IConversationRepository, ICronRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    IConversationRepository, ICronRepository, MessagePageParams, MessagePageResult, MessageRowUpdate,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
     SqliteCronRepository, SqliteSkillRepository, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
@@ -778,13 +778,12 @@ impl IConversationRepository for StubConvRepo {
         &self,
         _user_id: &str,
         _keyword: &str,
-        _page: u32,
+        _cursor: Option<&aionui_db::MessagePageCursor>,
         _page_size: u32,
-    ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
-        Ok(PaginatedResult {
+    ) -> Result<aionui_db::MessageSearchResult, aionui_db::DbError> {
+        Ok(aionui_db::MessageSearchResult {
             items: vec![],
-            total: 0,
-            has_more: false,
+            next_cursor: None,
         })
     }
     async fn list_artifacts(

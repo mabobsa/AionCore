@@ -379,7 +379,8 @@ pub struct DismissChoiceNoticeRequest {
 #[derive(Debug, Deserialize)]
 pub struct SearchMessagesQuery {
     pub keyword: String,
-    pub page: Option<u32>,
+    /// Last inspected message from the previous response, not the last match.
+    pub cursor: Option<String>,
     pub page_size: Option<u32>,
 }
 
@@ -562,8 +563,15 @@ pub struct MessageSearchItem {
     pub conversation: ConversationResponse,
 }
 
-/// Paginated search results for messages.
-pub type MessageSearchResponse = PaginatedResult<MessageSearchItem>;
+/// A bounded, newest-first search batch. `has_more` means there are messages
+/// left to inspect, not that additional matches are guaranteed. No total count
+/// is computed; empty batches with a cursor must be continued by the client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchResponse {
+    pub items: Vec<MessageSearchItem>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -860,10 +868,10 @@ mod tests {
 
     #[test]
     fn deserialize_search_query() {
-        let raw = json!({ "keyword": "rust", "page": 1, "page_size": 20 });
+        let raw = json!({ "keyword": "rust", "cursor": "v1.cursor", "page_size": 20 });
         let q: SearchMessagesQuery = serde_json::from_value(raw).unwrap();
         assert_eq!(q.keyword, "rust");
-        assert_eq!(q.page, Some(1));
+        assert_eq!(q.cursor.as_deref(), Some("v1.cursor"));
         assert_eq!(q.page_size, Some(20));
     }
 
@@ -1233,7 +1241,7 @@ mod tests {
 
     #[test]
     fn message_search_response_serialization() {
-        let resp: MessageSearchResponse = PaginatedResult {
+        let resp = MessageSearchResponse {
             items: vec![MessageSearchItem {
                 message_id: "m1".into(),
                 message_type: "text".into(),
@@ -1260,14 +1268,16 @@ mod tests {
                     prompt_capability: None,
                 },
             }],
-            total: 1,
+            next_cursor: None,
             has_more: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["items"][0]["message_id"], "m1");
+        assert!(json.get("total").is_none());
+        assert!(json["next_cursor"].is_null());
         assert_eq!(json["items"][0]["conversation"]["id"], "c1");
         assert_eq!(json["items"][0]["preview_text"], "matched");
-        assert_eq!(json["total"], 1);
+        assert_eq!(json["has_more"], false);
     }
 
     #[test]

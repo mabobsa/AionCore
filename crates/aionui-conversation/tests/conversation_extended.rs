@@ -542,12 +542,12 @@ async fn t9_1_keyword_match() {
 
     let query = SearchMessagesQuery {
         keyword: "review".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert_eq!(result.items.len(), 1);
-    assert_eq!(result.total, 1);
+    assert!(result.next_cursor.is_none());
 
     let item = &result.items[0];
     assert_eq!(item.message_type, "text");
@@ -569,12 +569,12 @@ async fn t9_2_no_match() {
 
     let query = SearchMessagesQuery {
         keyword: "xxxxnotexist".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert!(result.items.is_empty());
-    assert_eq!(result.total, 0);
+    assert!(result.next_cursor.is_none());
 }
 
 #[tokio::test]
@@ -593,12 +593,12 @@ async fn t9_3_search_pagination() {
 
     let query = SearchMessagesQuery {
         keyword: "keyword".into(),
-        page: Some(1),
+        cursor: None,
         page_size: Some(2),
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert_eq!(result.items.len(), 2);
-    assert_eq!(result.total, 5);
+    assert!(result.next_cursor.is_some());
     assert!(result.has_more);
 }
 
@@ -608,11 +608,28 @@ async fn t9_4_empty_keyword() {
 
     let query = SearchMessagesQuery {
         keyword: "".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let err = svc.search_messages(USER_ID, query).await.unwrap_err();
     assert!(matches!(err, ConversationError::BadRequest { .. }));
+}
+
+#[tokio::test]
+async fn search_rejects_invalid_cursor() {
+    let (svc, _repo, _b) = setup().await;
+    let error = svc
+        .search_messages(
+            USER_ID,
+            SearchMessagesQuery {
+                keyword: "needle".into(),
+                cursor: Some("invalid".into()),
+                page_size: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::BadRequest { reason } if reason == "invalid message cursor"));
 }
 
 #[tokio::test]
@@ -636,7 +653,7 @@ async fn t9_5_preview_text_extracts_from_json_content() {
 
     let query = SearchMessagesQuery {
         keyword: "search".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
@@ -670,7 +687,7 @@ async fn t9_6_search_result_includes_conversation_model() {
 
     let query = SearchMessagesQuery {
         keyword: "model test".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
@@ -693,12 +710,12 @@ async fn t9_7_search_does_not_leak_other_users_messages() {
 
     let query = SearchMessagesQuery {
         keyword: "secret".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let result = svc.search_messages("other_user_id", query).await.unwrap();
     assert!(result.items.is_empty());
-    assert_eq!(result.total, 0);
+    assert!(result.next_cursor.is_none());
 }
 
 // ── T10: Associated conversations ──────────────────────────────────
@@ -774,7 +791,7 @@ async fn t12_4_search_sql_injection() {
 
     let query = SearchMessagesQuery {
         keyword: "'; DROP TABLE messages; --".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     // Should return empty results, not crash

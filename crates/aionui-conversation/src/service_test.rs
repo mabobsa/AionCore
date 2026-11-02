@@ -39,7 +39,7 @@ use aionui_db::models::{
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
+    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, PersistedSessionState,
     SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantPreferenceRepository, SqliteMcpServerRepository, UpdateAgentAvailabilitySnapshotParams,
     UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
@@ -706,13 +706,12 @@ impl IConversationRepository for MockRepo {
         &self,
         _user_id: &str,
         _keyword: &str,
-        _page: u32,
+        _cursor: Option<&aionui_db::MessagePageCursor>,
         _page_size: u32,
-    ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
-        Ok(PaginatedResult {
+    ) -> Result<aionui_db::MessageSearchResult, aionui_db::DbError> {
+        Ok(aionui_db::MessageSearchResult {
             items: vec![],
-            total: 0,
-            has_more: false,
+            next_cursor: None,
         })
     }
 
@@ -3341,7 +3340,7 @@ async fn search_messages_empty_keyword_returns_bad_request() {
 
     let query = SearchMessagesQuery {
         keyword: "".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let err = svc.search_messages("user_1", query).await.unwrap_err();
@@ -3354,7 +3353,7 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
 
     let query = SearchMessagesQuery {
         keyword: "   ".into(),
-        page: None,
+        cursor: None,
         page_size: None,
     };
     let err = svc.search_messages("user_1", query).await.unwrap_err();

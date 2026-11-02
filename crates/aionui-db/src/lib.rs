@@ -37,7 +37,8 @@ pub use models::{
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchResult, MessageSearchRow,
+    StaleRuntimeMessageRow,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,

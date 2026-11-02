@@ -1340,7 +1340,7 @@ mod tests {
     use aionui_common::{AgentKillReason, ConversationStatus, PaginatedResult, TimestampMs};
     use aionui_db::{
         ConversationArtifactRow, ConversationFilters, ConversationRowUpdate, MessagePageParams, MessagePageResult,
-        MessageRowUpdate, MessageSearchRow,
+        MessageRowUpdate,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2657,13 +2657,12 @@ mod tests {
                 &self,
                 _user_id: &str,
                 _keyword: &str,
-                _page: u32,
+                _cursor: Option<&aionui_db::MessagePageCursor>,
                 _page_size: u32,
-            ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
-                Ok(PaginatedResult {
+            ) -> Result<aionui_db::MessageSearchResult, aionui_db::DbError> {
+                Ok(aionui_db::MessageSearchResult {
                     items: vec![],
-                    total: 0,
-                    has_more: false,
+                    next_cursor: None,
                 })
             }
         }
@@ -3147,13 +3146,12 @@ mod tests {
             &self,
             _user_id: &str,
             _keyword: &str,
-            _page: u32,
+            _cursor: Option<&aionui_db::MessagePageCursor>,
             _page_size: u32,
-        ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
-            Ok(PaginatedResult {
+        ) -> Result<aionui_db::MessageSearchResult, aionui_db::DbError> {
+            Ok(aionui_db::MessageSearchResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                next_cursor: None,
             })
         }
     }
@@ -3373,13 +3371,12 @@ mod tests {
             &self,
             _user_id: &str,
             _keyword: &str,
-            _page: u32,
+            _cursor: Option<&aionui_db::MessagePageCursor>,
             _page_size: u32,
-        ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
-            Ok(PaginatedResult {
+        ) -> Result<aionui_db::MessageSearchResult, aionui_db::DbError> {
+            Ok(aionui_db::MessageSearchResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                next_cursor: None,
             })
         }
 

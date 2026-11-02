@@ -10,7 +10,7 @@ use crate::models::{
 use crate::repository::begin_immediate;
 use crate::repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate,
     StaleRuntimeMessageRow,
 };
 
@@ -1452,66 +1452,10 @@ impl IConversationRepository for SqliteConversationRepository {
         &self,
         user_id: &str,
         keyword: &str,
-        page: u32,
+        cursor: Option<&MessagePageCursor>,
         page_size: u32,
-    ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
-        let effective_page = if page == 0 { 1 } else { page };
-        let effective_size = if page_size == 0 { 20 } else { page_size };
-        let offset = (effective_page - 1) * effective_size;
-        let fetch_limit = effective_size + 1;
-
-        let like_pattern = format!("%{keyword}%");
-
-        let count_row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM messages m \
-             INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.content LIKE ?",
-        )
-        .bind(user_id)
-        .bind(&like_pattern)
-        .fetch_one(&self.pool)
-        .await?;
-        let total = count_row.0 as u64;
-
-        let rows = sqlx::query_as::<_, MessageSearchRow>(
-            "SELECT \
-                m.id AS message_id, \
-                m.type, \
-                m.content, \
-                m.created_at, \
-                c.id AS conversation_id, \
-                c.name AS conversation_name, \
-                c.type AS conversation_type, \
-                c.extra AS conversation_extra, \
-                c.model AS conversation_model, \
-                c.status AS conversation_status, \
-                c.source AS conversation_source, \
-                c.channel_chat_id AS conversation_channel_chat_id, \
-                c.pinned AS conversation_pinned, \
-                c.pinned_at AS conversation_pinned_at, \
-                c.created_at AS conversation_created_at, \
-                c.updated_at AS conversation_updated_at \
-             FROM messages m \
-             INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.content LIKE ? \
-             ORDER BY m.created_at DESC \
-             LIMIT ? OFFSET ?",
-        )
-        .bind(user_id)
-        .bind(&like_pattern)
-        .bind(fetch_limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let has_more = rows.len() as u32 > effective_size;
-        let items = if has_more {
-            rows[..effective_size as usize].to_vec()
-        } else {
-            rows
-        };
-
-        Ok(PaginatedResult { items, total, has_more })
+    ) -> Result<crate::MessageSearchResult, DbError> {
+        crate::fork_extensions::message_search::search(&self.pool, user_id, keyword, cursor, page_size).await
     }
 
     async fn list_artifacts(
@@ -2959,9 +2903,9 @@ mod tests {
         msg2.content = r#"{"content":"Python 测试"}"#.to_string();
         repo.insert_message(&conv.user_id, &msg2).await.unwrap();
 
-        let result = repo.search_messages(SYSTEM_USER_ID, "审查", 1, 20).await.unwrap();
+        let result = repo.search_messages(SYSTEM_USER_ID, "审查", None, 20).await.unwrap();
         assert_eq!(result.items.len(), 1);
-        assert_eq!(result.total, 1);
+        assert!(result.next_cursor.is_none());
         assert_eq!(result.items[0].conversation_name, "Test Conversation");
     }
 
@@ -2975,11 +2919,11 @@ mod tests {
         repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
         let result = repo
-            .search_messages(SYSTEM_USER_ID, "xxxxnotexist", 1, 20)
+            .search_messages(SYSTEM_USER_ID, "xxxxnotexist", None, 20)
             .await
             .unwrap();
         assert!(result.items.is_empty());
-        assert_eq!(result.total, 0);
+        assert!(result.next_cursor.is_none());
     }
 
     #[tokio::test]
@@ -2996,10 +2940,10 @@ mod tests {
             repo.insert_message(&conv.user_id, &msg).await.unwrap();
         }
 
-        let result = repo.search_messages(SYSTEM_USER_ID, "keyword", 1, 2).await.unwrap();
+        let result = repo.search_messages(SYSTEM_USER_ID, "keyword", None, 2).await.unwrap();
         assert_eq!(result.items.len(), 2);
-        assert_eq!(result.total, 5);
-        assert!(result.has_more);
+        assert!(result.next_cursor.is_some());
+        assert_eq!(result.items[0].created_at, 5000);
     }
 
     // ── Filters tests ───────────────────────────────────────────────

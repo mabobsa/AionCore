@@ -40,8 +40,8 @@ use aionui_api_types::{
 use aionui_api_types::{ActiveConversationRuntime, ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
-    now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, TurnCancelCause, WorkspacePathValidationError, generate_short_id, now_ms,
+    validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ChoiceNoticeRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow,
@@ -3657,13 +3657,15 @@ impl ConversationService {
             });
         }
 
-        let page = query.page.unwrap_or(1);
-        let page_size = query.page_size.unwrap_or(20);
+        let cursor = query.cursor.as_deref().map(decode_message_cursor).transpose()?;
+        let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
 
         let result = self
             .conversation_repo
-            .search_messages(user_id, &query.keyword, page, page_size)
+            .search_messages(user_id, query.keyword.trim(), cursor.as_ref(), page_size)
             .await?;
+
+        let next_cursor = result.next_cursor.as_ref().map(encode_message_cursor).transpose()?;
 
         let items = result
             .items
@@ -3671,10 +3673,10 @@ impl ConversationService {
             .map(|row| search_row_to_item(row, &self.workspace_root))
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(PaginatedResult {
+        Ok(MessageSearchResponse {
             items,
-            total: result.total,
-            has_more: result.has_more,
+            has_more: next_cursor.is_some(),
+            next_cursor,
         })
     }
 }

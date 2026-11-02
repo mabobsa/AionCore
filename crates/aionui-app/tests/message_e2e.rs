@@ -547,7 +547,7 @@ async fn t9_2_search_no_match() {
         .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 0);
-    assert_eq!(json["data"]["total"], 0);
+    assert!(json["data"].get("total").is_none());
 }
 
 #[tokio::test]
@@ -570,15 +570,27 @@ async fn t9_3_search_pagination() {
     let resp = app
         .clone()
         .oneshot(get_with_token(
-            "/api/messages/search?keyword=Matching&page=1&page_size=2",
+            "/api/messages/search?keyword=Matching&page_size=2",
             &token,
         ))
         .await
         .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 2);
-    assert_eq!(json["data"]["total"], 5);
+    assert!(json["data"].get("total").is_none());
     assert_eq!(json["data"]["has_more"], true);
+    assert_eq!(json["data"]["items"][0]["message_id"], "msg-4");
+    let cursor = json["data"]["next_cursor"].as_str().unwrap();
+    let next = app
+        .oneshot(get_with_token(
+            &format!("/api/messages/search?keyword=Matching&page_size=2&cursor={cursor}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let next = body_json(next).await;
+    assert_eq!(next["data"]["items"][0]["message_id"], "msg-2");
+    assert_eq!(next["data"]["items"][1]["message_id"], "msg-1");
 }
 
 #[tokio::test]
@@ -712,7 +724,7 @@ async fn search_across_multiple_conversations() {
     let json = body_json(resp).await;
     let items = json["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
-    assert_eq!(json["data"]["total"], 2);
+    assert!(json["data"].get("total").is_none());
 }
 
 // ── T2.1: Send message ──────────────────────────────────────────────

@@ -3378,13 +3378,12 @@ mod tests {
             &self,
             _user_id: &str,
             _keyword: &str,
-            _page: u32,
+            _cursor: Option<&aionui_db::MessagePageCursor>,
             _page_size: u32,
-        ) -> Result<aionui_common::PaginatedResult<aionui_db::MessageSearchRow>, DbError> {
-            Ok(aionui_common::PaginatedResult {
+        ) -> Result<aionui_db::MessageSearchResult, DbError> {
+            Ok(aionui_db::MessageSearchResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                next_cursor: None,
             })
         }
     }

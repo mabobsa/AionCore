@@ -405,8 +405,7 @@ pub(crate) mod workspace_harness {
     use aionui_db::{
         ActivityCursor, ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository,
         IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, IProviderRepository,
-        ITeamRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, PageDirection,
-        UpdateTeamParams,
+        ITeamRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, PageDirection, UpdateTeamParams,
     };
     use aionui_realtime::EventBroadcaster;
     use async_trait::async_trait;
@@ -601,13 +600,12 @@ pub(crate) mod workspace_harness {
             &self,
             _user_id: &str,
             _keyword: &str,
-            _page: u32,
+            _cursor: Option<&aionui_db::MessagePageCursor>,
             _page_size: u32,
-        ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
-            Ok(PaginatedResult {
+        ) -> Result<aionui_db::MessageSearchResult, DbError> {
+            Ok(aionui_db::MessageSearchResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                next_cursor: None,
             })
         }
     }
@@ -1085,6 +1083,7 @@ pub(crate) mod workspace_harness {
                         pinned: None,
                         pinned_at: None,
                         extra: Some(serde_json::to_string(&extra).unwrap()),
+                        extra_patch: None,
                         status: None,
                         updated_at: Some(now_ms()),
                         project_id: None,

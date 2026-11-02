@@ -1002,8 +1002,8 @@ async fn search_messages_across_conversations() {
     let msg3 = make_message(&c1.id, "unrelated content");
     repo.insert_message(&c1.user_id, &msg3).await.unwrap();
 
-    let result = repo.search_messages(USER_ID, "审查", 1, 20).await.unwrap();
-    assert_eq!(result.total, 2);
+    let result = repo.search_messages(USER_ID, "审查", None, 20).await.unwrap();
+    assert!(result.next_cursor.is_none());
     assert_eq!(result.items.len(), 2);
 
     // Verify conversation names are included
@@ -1022,12 +1022,11 @@ async fn search_messages_empty_result() {
     repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
     let result = repo
-        .search_messages(USER_ID, "nonexistent_keyword", 1, 20)
+        .search_messages(USER_ID, "nonexistent_keyword", None, 20)
         .await
         .unwrap();
     assert!(result.items.is_empty());
-    assert_eq!(result.total, 0);
-    assert!(!result.has_more);
+    assert!(result.next_cursor.is_none());
 }
 
 #[tokio::test]
@@ -1042,18 +1041,146 @@ async fn search_messages_pagination() {
         repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
-    let p1 = repo.search_messages(USER_ID, "searchable", 1, 2).await.unwrap();
+    let p1 = repo.search_messages(USER_ID, "searchable", None, 2).await.unwrap();
     assert_eq!(p1.items.len(), 2);
-    assert_eq!(p1.total, 5);
-    assert!(p1.has_more);
+    assert!(p1.next_cursor.is_some());
+    assert_eq!(
+        p1.items.iter().map(|item| item.created_at).collect::<Vec<_>>(),
+        vec![5000, 4000]
+    );
 
-    let p2 = repo.search_messages(USER_ID, "searchable", 2, 2).await.unwrap();
+    let p2 = repo
+        .search_messages(USER_ID, "searchable", p1.next_cursor.as_ref(), 2)
+        .await
+        .unwrap();
     assert_eq!(p2.items.len(), 2);
-    assert!(p2.has_more);
+    assert!(p2.next_cursor.is_some());
+    assert_eq!(
+        p2.items.iter().map(|item| item.created_at).collect::<Vec<_>>(),
+        vec![3000, 2000]
+    );
 
-    let p3 = repo.search_messages(USER_ID, "searchable", 3, 2).await.unwrap();
+    let p3 = repo
+        .search_messages(USER_ID, "searchable", p2.next_cursor.as_ref(), 2)
+        .await
+        .unwrap();
     assert_eq!(p3.items.len(), 1);
-    assert!(!p3.has_more);
+    assert!(p3.next_cursor.is_none());
+    assert_eq!(p3.items[0].created_at, 1000);
+}
+
+#[tokio::test]
+async fn search_messages_advances_through_empty_ranges_without_counting_history() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("sparse-search");
+    repo.create(&conv).await.unwrap();
+    for i in 0..513 {
+        let mut msg = make_message(&conv.id, if i == 0 { "old needle" } else { "unrelated" });
+        msg.id = format!("sparse-{i:04}");
+        msg.created_at = i + 1;
+        repo.insert_message(USER_ID, &msg).await.unwrap();
+    }
+    let first = repo.search_messages(USER_ID, "needle", None, 20).await.unwrap();
+    assert!(first.items.is_empty());
+    assert_eq!(first.next_cursor.as_ref().unwrap().id, "sparse-0257");
+    let second = repo
+        .search_messages(USER_ID, "needle", first.next_cursor.as_ref(), 20)
+        .await
+        .unwrap();
+    assert!(second.items.is_empty());
+    assert_eq!(second.next_cursor.as_ref().unwrap().id, "sparse-0001");
+    let last = repo
+        .search_messages(USER_ID, "needle", second.next_cursor.as_ref(), 20)
+        .await
+        .unwrap();
+    assert_eq!(last.items[0].message_id, "sparse-0000");
+    assert!(last.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn search_messages_cursor_survives_timestamp_ties_new_inserts_and_deleted_anchor() {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("stable-search");
+    repo.create(&conv).await.unwrap();
+    for id in ["a", "b", "c", "d"] {
+        let mut msg = make_message(&conv.id, "needle");
+        msg.id = id.into();
+        msg.created_at = 1000;
+        repo.insert_message(USER_ID, &msg).await.unwrap();
+    }
+    let first = repo.search_messages(USER_ID, "needle", None, 2).await.unwrap();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|row| row.message_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["d", "c"]
+    );
+    sqlx::query("DELETE FROM messages WHERE id = 'c'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut newer = make_message(&conv.id, "needle");
+    newer.id = "new".into();
+    newer.created_at = 2000;
+    repo.insert_message(USER_ID, &newer).await.unwrap();
+    let second = repo
+        .search_messages(USER_ID, "needle", first.next_cursor.as_ref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|row| row.message_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b", "a"]
+    );
+    assert!(second.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn search_messages_keeps_archived_hits_and_never_returns_another_users_cursor() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let mine = make_conversation("mine-search");
+    let mut other = make_conversation("other-search");
+    other.user_id = "user_2".into();
+    repo.create(&mine).await.unwrap();
+    repo.create(&other).await.unwrap();
+    for (conv, at) in [(&mine, 1000), (&other, 2000)] {
+        let mut msg = make_message(&conv.id, "needle");
+        msg.created_at = at;
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
+    }
+    sqlx::query("UPDATE conversations SET archived_at = 1234 WHERE id = ?")
+        .bind(&mine.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let result = repo.search_messages(USER_ID, "needle", None, 1).await.unwrap();
+    assert_eq!(result.items[0].conversation_id, mine.id);
+    assert!(result.next_cursor.is_none());
+    let empty = repo.search_messages("no-user", "needle", None, 1).await.unwrap();
+    assert!(empty.items.is_empty() && empty.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn search_messages_treats_wildcards_as_literal_text() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("literal-search");
+    repo.create(&conv).await.unwrap();
+    for text in ["100% foo_bar", "1000 fooXbar"] {
+        repo.insert_message(USER_ID, &make_message(&conv.id, text))
+            .await
+            .unwrap();
+    }
+    for keyword in ["100%", "foo_bar"] {
+        let result = repo.search_messages(USER_ID, keyword, None, 20).await.unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert!(result.items[0].content.contains("100% foo_bar"));
+    }
 }
 
 // ── Pinned update flow ──────────────────────────────────────────────
