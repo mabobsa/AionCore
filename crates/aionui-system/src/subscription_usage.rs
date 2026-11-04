@@ -109,4 +109,62 @@ mod tests {
         assert_eq!(response["data"]["claudeAccounts"], published["claudeAccounts"]);
         assert_eq!(response["data"]["claude"], published["claude"]);
     }
+
+    #[test]
+    fn preserves_codex_session_window_when_serializing_the_web_response() {
+        let path = test_path("codex-session");
+        let codex = serde_json::json!({
+            "state": "ready",
+            "updatedAt": "2026-11-03T00:00:00.000Z",
+            "session": {"usedPercent": 49, "resetsAt": "2026-11-03T05:00:00.000Z", "windowDurationMins": 300},
+            "weekly": {"usedPercent": 8, "resetsAt": "2026-11-10T00:00:00.000Z", "windowDurationMins": 10080},
+            "limitReached": false
+        });
+        let published = serde_json::json!({
+            "schemaVersion": 1,
+            "state": "partial",
+            "generatedAt": "2026-11-03T00:00:00.000Z",
+            "updatedAt": "2026-11-03T00:00:00.000Z",
+            "retryAfterMs": null,
+            "claude": {"state": "unavailable", "updatedAt": null, "session": null, "weekly": null},
+            "codex": codex
+        });
+        fs::write(&path, serde_json::to_vec(&published).unwrap()).unwrap();
+
+        let snapshot = read_subscription_usage_from_path(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let response = serde_json::to_value(aionui_api_types::ApiResponse::ok(Some(snapshot))).unwrap();
+
+        assert_eq!(response["data"]["codex"], published["codex"]);
+    }
+
+    #[test]
+    fn serializes_a_missing_codex_session_window_as_null() {
+        let path = test_path("codex-weekly-only");
+        fs::write(
+            &path,
+            r#"{
+                "schemaVersion":1,
+                "state":"partial",
+                "generatedAt":"2026-11-03T00:00:00.000Z",
+                "updatedAt":"2026-11-03T00:00:00.000Z",
+                "retryAfterMs":null,
+                "claude":{"state":"unavailable","updatedAt":null,"session":null,"weekly":null},
+                "codex":{
+                    "state":"ready",
+                    "updatedAt":"2026-11-03T00:00:00.000Z",
+                    "weekly":{"usedPercent":8,"resetsAt":null,"windowDurationMins":10080},
+                    "limitReached":false
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let snapshot = read_subscription_usage_from_path(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let response = serde_json::to_value(aionui_api_types::ApiResponse::ok(Some(snapshot))).unwrap();
+
+        assert!(response["data"]["codex"]["session"].is_null());
+        assert_eq!(response["data"]["codex"]["weekly"]["usedPercent"], 8);
+    }
 }

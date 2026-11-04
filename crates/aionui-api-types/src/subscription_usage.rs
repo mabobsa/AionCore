@@ -57,6 +57,10 @@ pub struct CodexSubscriptionUsageWindow {
 pub struct CodexSubscriptionUsage {
     pub state: ProviderUsageState,
     pub updated_at: Option<String>,
+    /// Fork: 5-hour window. `None` when the plan has no such limit or the
+    /// snapshot predates the field.
+    #[serde(default)]
+    pub session: Option<CodexSubscriptionUsageWindow>,
     pub weekly: Option<CodexSubscriptionUsageWindow>,
     pub limit_reached: bool,
 }
@@ -112,6 +116,7 @@ mod tests {
         assert_eq!(snapshot.state, SubscriptionUsageState::Ready);
         assert_eq!(snapshot.claude.state, ProviderUsageState::Ready);
         assert_eq!(snapshot.codex.weekly.as_ref().unwrap().used_percent, 73);
+        assert!(snapshot.codex.session.is_none());
         assert!(snapshot.claude_accounts.is_none());
         assert!(serde_json::to_value(snapshot).unwrap().get("claudeAccounts").is_none());
     }
