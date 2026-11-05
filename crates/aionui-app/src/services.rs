@@ -429,6 +429,7 @@ impl AppServices {
             rate_limiter: Arc::new(RateLimiter::new(Arc::new(SystemClock))),
             notify: session_message_notify.clone(),
         }));
+        fork_integrations.attach_session_messages(&session_message_service);
         // Cancel ⇒ clear the deliveries queued for that conversation. Injected
         // rather than called directly because the queue lives in an upper-layer
         // crate (see `OnConversationTurnCancelled`).

@@ -36,6 +36,10 @@ use crate::error::SessionMessageError;
 use crate::queue::{DeliveryQueue, PendingDelivery, TTL_MS};
 use crate::rate_limit::{RateLimiter, RateVerdict};
 
+// Fork: cross-machine delivery through MindNProgress.
+mod remote;
+pub use remote::{RemoteSessionDelivery, RemoteSessionRelay, RemoteSessionRelayRequest};
+
 /// Build the recipient-side block.
 ///
 /// The short reply pointer after `reply_to` is deliberate (~10-15 tokens): the
@@ -101,11 +105,16 @@ pub struct SessionMessageDeps {
 
 pub struct SessionMessageService {
     deps: SessionMessageDeps,
+    /// Fork: relay for targets on another machine (`service/remote.rs`).
+    remote_relay: std::sync::OnceLock<Arc<dyn RemoteSessionRelay>>,
 }
 
 impl SessionMessageService {
     pub fn new(deps: SessionMessageDeps) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            remote_relay: std::sync::OnceLock::new(),
+        }
     }
 
     pub fn queue(&self) -> &Arc<DeliveryQueue> {
@@ -225,7 +234,13 @@ impl SessionMessageService {
             })?
             // Scoped by user_id, so another user's id lands here: 404, not 403
             // — refuse without leaking that the id exists.
-            .ok_or_else(|| SessionMessageError::TargetNotFound { id: to.to_owned() })?;
+            .ok_or_else(|| SessionMessageError::TargetNotFound { id: to.to_owned() });
+        // Fork: a target not on this machine may be on another one (`service/remote.rs`).
+        let Ok(target) = target else {
+            return self
+                .relay_missing_target(user_id, &sender, from_conversation_id, to, &req.message)
+                .await;
+        };
         if team_id_from_extra_str(&target.extra).is_some() {
             return Err(SessionMessageError::TargetIsTeam { id: to.to_owned() });
         }

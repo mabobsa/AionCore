@@ -163,14 +163,62 @@ impl MindNProgressNavigationService {
     }
 }
 
-pub(super) async fn relay_request<T: DeserializeOwned>(
-    client: &Client,
+/// Outcome of handing a cross-machine session message to MindNProgress.
+pub enum SessionMessageRelayOutcome {
+    /// This machine has no MindNProgress integration.
+    NotConfigured,
+    /// MindNProgress could not be reached.
+    Unavailable,
+    /// MindNProgress answered with this HTTP status and JSON body.
+    Answered { status: u16, body: serde_json::Value },
+}
+
+const SESSION_MESSAGE_RELAY_PATH: &str = "/api/integrations/aionui/session-messages";
+// Covers finding the target machine and a sub-machine Runner picking the delivery up.
+const SESSION_MESSAGE_RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+impl MindNProgressNavigationService {
+    /// Fork: ask MindNProgress to deliver a session message to a conversation
+    /// on another machine. `from_conversation_id` identifies the sender so a
+    /// sub-machine Runner relay can verify it.
+    pub async fn relay_session_message(
+        &self,
+        user_id: &str,
+        from_conversation_id: &str,
+        body: &serde_json::Value,
+    ) -> SessionMessageRelayOutcome {
+        let Ok(integration) = self.resolve_integration(user_id).await else {
+            return SessionMessageRelayOutcome::NotConfigured;
+        };
+        let Ok(token) = read_integration_token(&integration).await else {
+            return SessionMessageRelayOutcome::NotConfigured;
+        };
+        let mut url = integration.api_base_url.clone();
+        url.set_path(SESSION_MESSAGE_RELAY_PATH);
+        let mut request = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .timeout(SESSION_MESSAGE_RELAY_TIMEOUT)
+            .json(body);
+        if matches!(integration.token, IntegrationToken::Runner(_)) {
+            request = request.header("x-mnp-ai-conversation-id", from_conversation_id);
+        }
+        let Ok(response) = request.send().await else {
+            return SessionMessageRelayOutcome::Unavailable;
+        };
+        let status = response.status().as_u16();
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        SessionMessageRelayOutcome::Answered { status, body }
+    }
+}
+
+async fn read_integration_token(
     integration: &MindNProgressIntegration,
-    method: Method,
-    conversation_id: &str,
-    select: bool,
-    selection_device_address: Option<IpAddr>,
-) -> Result<T, MindNProgressNavigationError> {
+) -> Result<String, MindNProgressNavigationError> {
     let token = match &integration.token {
         IntegrationToken::File(path) => tokio::fs::read_to_string(path)
             .await
@@ -181,6 +229,18 @@ pub(super) async fn relay_request<T: DeserializeOwned>(
     if token.is_empty() {
         return Err(MindNProgressNavigationError::NotConfigured);
     }
+    Ok(token.to_owned())
+}
+
+pub(super) async fn relay_request<T: DeserializeOwned>(
+    client: &Client,
+    integration: &MindNProgressIntegration,
+    method: Method,
+    conversation_id: &str,
+    select: bool,
+    selection_device_address: Option<IpAddr>,
+) -> Result<T, MindNProgressNavigationError> {
+    let token = read_integration_token(integration).await?;
 
     let mut request = client
         .request(method, integration.endpoint(conversation_id, select)?)

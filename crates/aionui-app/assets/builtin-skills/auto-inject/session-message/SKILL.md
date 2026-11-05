@@ -123,6 +123,16 @@ directory:
   blocked by its sandbox or permissions.
 - To share file content, put the content itself into `message`.
 
+## Conversations on another machine
+
+With MindNProgress connected, an id that is not on this machine is relayed to
+the machine that holds it — use the same command. A message relayed from there
+shows `workspace: <path> on another machine (<name>)`; its paths are never
+readable here, so the cross-workspace rule always applies. `session list` and
+`diagnose` see only this machine. `transport_unavailable` may mean that machine
+is offline; if it says the message may already have been delivered, check
+before sending again.
+
 ## Getting more detail about a target conversation
 
 For a target's workspace path, whether it is currently running a turn, or

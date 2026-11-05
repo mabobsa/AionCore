@@ -5,5 +5,5 @@ mod service;
 mod state;
 
 pub use routes::mindnprogress_navigation_routes;
-pub use service::MindNProgressNavigationService;
+pub use service::{MindNProgressNavigationService, SessionMessageRelayOutcome};
 pub use state::MindNProgressNavigationRouterState;
