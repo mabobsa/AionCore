@@ -125,7 +125,13 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 async fn fact_of(uri: &str, path: &Path) -> Result<EntryFact, FsError> {
     let meta = tokio::fs::symlink_metadata(path).await.map_err(|e| map_io(uri, &e))?;
     let ft = meta.file_type();
-    let (kind, symlink_target) = if ft.is_symlink() {
+    // Fork: a link to a directory (Windows junction, directory symlink) is listed
+    // as a directory so the explorer can expand it. Remove/copy still decide on
+    // their own `symlink_metadata`, so they act on the link, not its target.
+    let links_to_dir = ft.is_symlink() && tokio::fs::metadata(path).await.is_ok_and(|target| target.is_dir());
+    let (kind, symlink_target) = if links_to_dir {
+        (Kind::Dir, None)
+    } else if ft.is_symlink() {
         let target = tokio::fs::read_link(path)
             .await
             .ok()
