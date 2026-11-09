@@ -594,6 +594,53 @@ async fn t9_3_search_pagination() {
 }
 
 #[tokio::test]
+async fn t9_3b_search_match_all_terms() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Search All Terms").await;
+    insert_message(&services, &conv_id, "msg-both", "AAAA BBBB CCCC", 2000).await;
+    insert_message(&services, &conv_id, "msg-one", "AAAA BBBB", 1000).await;
+
+    let search = |query: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let resp = app
+                .oneshot(get_with_token(&format!("/api/messages/search?{query}"), &token))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await["data"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["message_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    assert!(search("keyword=AAAA%20CCCC").await.is_empty());
+    assert!(search("keyword=AAAA%20CCCC&match_all=false").await.is_empty());
+    assert_eq!(search("keyword=AAAA%20CCCC&match_all=true").await, vec!["msg-both"]);
+    // Repeated terms collapse to one ordinary keyword instead of a phrase.
+    assert_eq!(
+        search("keyword=AAAA%20aaaa&match_all=true").await,
+        vec!["msg-both", "msg-one"]
+    );
+
+    let too_many = (0..33).map(|i| format!("t{i}")).collect::<Vec<_>>().join("%20");
+    let resp = app
+        .oneshot(get_with_token(
+            &format!("/api/messages/search?keyword={too_many}&match_all=true"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn t9_4_search_empty_keyword() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

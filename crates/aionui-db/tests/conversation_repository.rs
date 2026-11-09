@@ -1183,6 +1183,55 @@ async fn search_messages_treats_wildcards_as_literal_text() {
     }
 }
 
+#[tokio::test]
+async fn search_messages_all_terms_requires_every_term_in_one_message() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("all-terms-search");
+    repo.create(&conv).await.unwrap();
+    for (id, text, at) in [
+        ("both-new", "AAAA BBBB CCCC", 4000),
+        ("first-only", "AAAA BBBB", 3000),
+        ("last-only", "BBBB cccc", 2000),
+        ("both-old", "cccc then aaaa", 1000),
+        ("literal", "100% foo_bar", 900),
+        ("wildcard-lookalike", "1000 fooXbar", 800),
+    ] {
+        let mut msg = make_message(&conv.id, text);
+        msg.id = id.into();
+        msg.created_at = at;
+        repo.insert_message(USER_ID, &msg).await.unwrap();
+    }
+    let ids = |result: &aionui_db::MessageSearchResult| {
+        result
+            .items
+            .iter()
+            .map(|row| row.message_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // The phrase search keeps its meaning; only the terms search splits it.
+    let phrase = repo.search_messages(USER_ID, "AAAA CCCC", None, 20).await.unwrap();
+    assert!(phrase.items.is_empty());
+
+    let terms = ["aaaa".to_owned(), "CCCC".to_owned()];
+    let first = repo.search_messages_all_terms(USER_ID, &terms, None, 1).await.unwrap();
+    assert_eq!(ids(&first), vec!["both-new"]);
+    assert!(first.next_cursor.is_some());
+    let rest = repo
+        .search_messages_all_terms(USER_ID, &terms, first.next_cursor.as_ref(), 20)
+        .await
+        .unwrap();
+    assert_eq!(ids(&rest), vec!["both-old"]);
+    assert!(rest.next_cursor.is_none());
+
+    let literal = ["100%".to_owned(), "foo_bar".to_owned()];
+    let result = repo
+        .search_messages_all_terms(USER_ID, &literal, None, 20)
+        .await
+        .unwrap();
+    assert_eq!(ids(&result), vec!["literal"]);
+}
+
 // ── Pinned update flow ──────────────────────────────────────────────
 
 #[tokio::test]

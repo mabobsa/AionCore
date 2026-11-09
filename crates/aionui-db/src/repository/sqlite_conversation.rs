@@ -1458,6 +1458,16 @@ impl IConversationRepository for SqliteConversationRepository {
         crate::fork_extensions::message_search::search(&self.pool, user_id, keyword, cursor, page_size).await
     }
 
+    async fn search_messages_all_terms(
+        &self,
+        user_id: &str,
+        terms: &[String],
+        cursor: Option<&MessagePageCursor>,
+        page_size: u32,
+    ) -> Result<crate::MessageSearchResult, DbError> {
+        crate::fork_extensions::message_search::search_all_terms(&self.pool, user_id, terms, cursor, page_size).await
+    }
+
     async fn list_artifacts(
         &self,
         user_id: &str,

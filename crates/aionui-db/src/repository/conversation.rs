@@ -319,6 +319,18 @@ pub trait IConversationRepository: Send + Sync {
         page_size: u32,
     ) -> Result<MessageSearchResult, DbError>;
 
+    /// Like [`Self::search_messages`], but every term must appear in the same
+    /// message. The default narrows the first term's range in memory.
+    async fn search_messages_all_terms(
+        &self,
+        user_id: &str,
+        terms: &[String],
+        cursor: Option<&MessagePageCursor>,
+        page_size: u32,
+    ) -> Result<MessageSearchResult, DbError> {
+        crate::fork_extensions::message_search::search_all_terms_fallback(self, user_id, terms, cursor, page_size).await
+    }
+
     /// Returns persisted conversation artifacts ordered by `created_at`.
     async fn list_artifacts(
         &self,

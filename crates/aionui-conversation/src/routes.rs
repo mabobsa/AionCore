@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::ActiveConversationRuntimesResponse;
+use aionui_api_types::SearchMessagesMatchQuery;
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, ChoiceNoticeListResponse, CloneConversationRequest, ConfirmRequest,
@@ -535,10 +536,11 @@ async fn search_messages(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Query(query): Query<SearchMessagesQuery>,
+    Query(match_query): Query<SearchMessagesMatchQuery>,
 ) -> Result<Json<ApiResponse<MessageSearchResponse>>, ApiError> {
     let result = state
         .service
-        .search_messages(&user.id, query)
+        .search_messages_matching(&user.id, query, match_query)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

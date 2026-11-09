@@ -1,6 +1,6 @@
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use crate::{DbError, MessagePageCursor, MessageSearchResult, MessageSearchRow};
+use crate::{DbError, IConversationRepository, MessagePageCursor, MessageSearchResult, MessageSearchRow};
 
 // Bound the work even when a keyword is rare or absent. Clients publish each
 // batch immediately and continue from its cursor while the search stays open.
@@ -20,16 +20,88 @@ pub(crate) async fn search(
     cursor: Option<&MessagePageCursor>,
     page_size: u32,
 ) -> Result<MessageSearchResult, DbError> {
-    let page_size = if page_size == 0 { 20 } else { page_size.min(100) } as usize;
-    let pattern = format!(
+    search_patterns(pool, user_id, &[like_pattern(keyword)], cursor, page_size).await
+}
+
+/// Search messages that contain every term. Each term keeps the literal
+/// wildcard handling and the scan bound of a single-keyword search.
+pub(crate) async fn search_all_terms(
+    pool: &SqlitePool,
+    user_id: &str,
+    terms: &[String],
+    cursor: Option<&MessagePageCursor>,
+    page_size: u32,
+) -> Result<MessageSearchResult, DbError> {
+    let patterns = terms.iter().map(|term| like_pattern(term)).collect::<Vec<_>>();
+    search_patterns(pool, user_id, &patterns, cursor, page_size).await
+}
+
+/// Narrow the first term's range in memory for repositories without SQL.
+/// The range cursor is kept, so no inspected message is skipped.
+pub(crate) async fn search_all_terms_fallback<R>(
+    repo: &R,
+    user_id: &str,
+    terms: &[String],
+    cursor: Option<&MessagePageCursor>,
+    page_size: u32,
+) -> Result<MessageSearchResult, DbError>
+where
+    R: IConversationRepository + ?Sized,
+{
+    let Some(first) = terms.first() else {
+        return Ok(empty_result());
+    };
+    let mut result = repo.search_messages(user_id, first, cursor, page_size).await?;
+    // Mirror SQLite LIKE, which folds ASCII case only.
+    let terms = terms.iter().map(|term| term.to_ascii_lowercase()).collect::<Vec<_>>();
+    result.items.retain(|row| {
+        let content = row.content.to_ascii_lowercase();
+        terms.iter().all(|term| content.contains(term.as_str()))
+    });
+    Ok(result)
+}
+
+fn empty_result() -> MessageSearchResult {
+    MessageSearchResult {
+        items: Vec::new(),
+        next_cursor: None,
+    }
+}
+
+fn like_pattern(term: &str) -> String {
+    format!(
         "%{}%",
-        keyword.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-    );
+        term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    )
+}
+
+fn push_content_match<'args>(query: &mut QueryBuilder<'args, Sqlite>, patterns: &'args [String]) {
+    query.push("(");
+    for (index, pattern) in patterns.iter().enumerate() {
+        if index > 0 {
+            query.push(" AND ");
+        }
+        query.push("m.content LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
+    }
+    query.push(")");
+}
+
+async fn search_patterns(
+    pool: &SqlitePool,
+    user_id: &str,
+    patterns: &[String],
+    cursor: Option<&MessagePageCursor>,
+    page_size: u32,
+) -> Result<MessageSearchResult, DbError> {
+    if patterns.is_empty() {
+        return Ok(empty_result());
+    }
+    let page_size = if page_size == 0 { 20 } else { page_size.min(100) } as usize;
     // Keep messages as the outer loop. Letting SQLite start with conversations
     // forces it to inspect and sort the entire history before applying LIMIT.
-    let mut scan = QueryBuilder::<Sqlite>::new("SELECT m.id, m.created_at, m.content LIKE ");
-    scan.push_bind(&pattern);
-    scan.push(" ESCAPE '\\' AS matches FROM messages m INDEXED BY idx_messages_search_recent ");
+    let mut scan = QueryBuilder::<Sqlite>::new("SELECT m.id, m.created_at, ");
+    push_content_match(&mut scan, patterns);
+    scan.push(" AS matches FROM messages m INDEXED BY idx_messages_search_recent ");
     scan.push("CROSS JOIN conversations c ON c.id = m.conversation_id WHERE c.user_id = ");
     scan.push_bind(user_id);
     if let Some(cursor) = cursor {
@@ -85,9 +157,8 @@ pub(crate) async fn search(
             ids.push_bind(id);
         }
         ids.push_unseparated(")");
-        hits.push(" AND m.content LIKE ")
-            .push_bind(&pattern)
-            .push(" ESCAPE '\\'");
+        hits.push(" AND ");
+        push_content_match(&mut hits, patterns);
         hits.push(" ORDER BY m.created_at DESC, m.id DESC");
         hits.build_query_as::<MessageSearchRow>().fetch_all(pool).await?
     };

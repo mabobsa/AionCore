@@ -384,6 +384,15 @@ pub struct SearchMessagesQuery {
     pub page_size: Option<u32>,
 }
 
+/// Optional matching mode for `GET /api/messages/search`, read from the same
+/// query string as [`SearchMessagesQuery`].
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct SearchMessagesMatchQuery {
+    /// Require every whitespace-separated keyword term in the same message.
+    #[serde(default)]
+    pub match_all: bool,
+}
+
 // ── Response types ─────────────────────────────────────────────────
 
 /// Full conversation object returned in API responses.

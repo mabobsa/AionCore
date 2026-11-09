@@ -2,6 +2,7 @@ mod conversation_list;
 mod deletion;
 mod external_report;
 mod mcp_reload;
+mod message_search;
 pub mod native_history;
 pub(crate) mod native_questions;
 mod turn_observation;
@@ -23,6 +24,7 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
+use aionui_api_types::SearchMessagesMatchQuery;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, ChoiceNoticeListResponse, ChoiceNoticeResponse,
@@ -3651,6 +3653,17 @@ impl ConversationService {
         user_id: &str,
         query: SearchMessagesQuery,
     ) -> Result<MessageSearchResponse, ConversationError> {
+        self.search_messages_matching(user_id, query, SearchMessagesMatchQuery::default())
+            .await
+    }
+
+    /// Search messages; `match_query` can require every term in one message.
+    pub async fn search_messages_matching(
+        &self,
+        user_id: &str,
+        query: SearchMessagesQuery,
+        match_query: SearchMessagesMatchQuery,
+    ) -> Result<MessageSearchResponse, ConversationError> {
         if query.keyword.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "keyword must not be empty".into(),
@@ -3661,8 +3674,7 @@ impl ConversationService {
         let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
 
         let result = self
-            .conversation_repo
-            .search_messages(user_id, query.keyword.trim(), cursor.as_ref(), page_size)
+            .search_message_rows(user_id, query.keyword.trim(), match_query, cursor.as_ref(), page_size)
             .await?;
 
         let next_cursor = result.next_cursor.as_ref().map(encode_message_cursor).transpose()?;
