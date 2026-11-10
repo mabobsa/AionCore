@@ -64,6 +64,9 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
                 "cardId": "card-1",
                 "cardTitle": "Card title",
                 "archived": false,
+                "cardRole": "group-coordinator",
+                "conversationRole": "auxiliary",
+                "primaryConversationId": "primary-conversation",
                 "group": {
                     "id": "group-1",
                     "title": "Renamed group",
@@ -94,6 +97,9 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
                 "cardId": "card-1",
                 "cardTitle": "Card title",
                 "archived": false,
+                "cardRole": "group-coordinator",
+                "conversationRole": "auxiliary",
+                "primaryConversationId": null,
                 "group": {
                     "id": "group-1",
                     "title": "Renamed group",
@@ -152,6 +158,12 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
     assert_eq!(lookup_body["data"]["target"]["group"]["id"], "group-1");
     assert_eq!(lookup_body["data"]["target"]["group"]["title"], "Renamed group");
     assert_eq!(lookup_body["data"]["target"]["group"]["role"], "coordinator");
+    assert_eq!(lookup_body["data"]["target"]["cardRole"], "group-coordinator");
+    assert_eq!(lookup_body["data"]["target"]["conversationRole"], "auxiliary");
+    assert_eq!(
+        lookup_body["data"]["target"]["primaryConversationId"],
+        "primary-conversation"
+    );
     assert!(!lookup_body.to_string().contains("integration-secret"));
     assert!(!lookup_body.to_string().contains("10.77.15.55"));
 
@@ -195,6 +207,15 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
     assert_eq!(selection_body["data"]["selected"], true);
     assert_eq!(selection_body["data"]["message"], "selected");
     assert_eq!(selection_body["data"]["target"]["group"]["title"], "Renamed group");
+    assert_eq!(selection_body["data"]["target"]["cardRole"], "group-coordinator");
+    assert_eq!(selection_body["data"]["target"]["conversationRole"], "auxiliary");
+    assert!(
+        selection_body["data"]["target"]
+            .as_object()
+            .unwrap()
+            .contains_key("primaryConversationId")
+    );
+    assert!(selection_body["data"]["target"]["primaryConversationId"].is_null());
     assert!(!selection_body.to_string().contains("integration-secret"));
     assert!(!selection_body.to_string().contains("10.77.15.55"));
 
