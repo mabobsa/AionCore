@@ -4,7 +4,7 @@
 use crate::types::SendMessageData;
 
 const INSTRUCTIONS: &str = r#"[AionUi choice notifications]
-When you need an actual choice, approval, or answer from the user, put [[AIONUI_USER_CHOICE_REQUIRED]] alone on a line immediately BEFORE the question. Follow with the question and any choices in the user's language.
+Prefer this marker over AskUserQuestion; give enough context to decide. When you need an actual choice, approval, or answer from the user, put [[AIONUI_USER_CHOICE_REQUIRED]] alone on a line immediately BEFORE the question.
 
 Write the entire response, including the question and any choices, in the language explicitly requested by the user; otherwise follow the language of the current conversation. The language used by these instructions does not select or change the response language.
 
