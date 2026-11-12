@@ -22,6 +22,12 @@ fn platform_trash_reports_failure_instead_of_deleting() {
     assert!(!err.is_empty(), "the failure must carry a reason");
 }
 
+// Ignored: drives the real desktop-shell trash. On macOS it scripts Finder,
+// which needs a logged-in GUI session and intermittently times out under a
+// headless/busy test run (AppleEvent -1712). It depends on the host environment,
+// not on our code, so it is kept out of the default run. Run explicitly with
+// `--ignored` in an interactive session to exercise the real move.
+#[ignore = "drives the real OS trash (Finder/desktop shell); environment-dependent, not hermetic"]
 #[test]
 fn platform_trash_moves_a_real_file_out_of_the_work_tree() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

@@ -160,6 +160,10 @@ fn data() -> Value {
                 "description": "PreToolUse permission gate spawned by the Antigravity CLI (agy) over stdin/stdout, not invoked by agents."
             },
             {
+                "name": "database",
+                "description": "Operator CLI to inspect local database usage, or compact it while the server is stopped."
+            },
+            {
                 "name": "doctor",
                 "description": "Human/developer self-check for agent backend availability."
             },

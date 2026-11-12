@@ -24,6 +24,13 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     // `cron_job_runs.owner_id` is the scheduler's run-lease holder, NOT a
     // user reference — ownership flows from `job_id`.
     ("cron_job_runs", "job_id", "cron_jobs"),
+    // A dispatch row belongs to the conversation that initiated it; its owner is
+    // reached through that conversation, so adoption of the root covers it.
+    (
+        "external_conversation_dispatches",
+        "actor_conversation_id",
+        "conversations",
+    ),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_tasks", "team_id", "teams"),

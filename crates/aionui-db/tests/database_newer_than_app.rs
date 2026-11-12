@@ -11,8 +11,13 @@ use aionui_db::{
     init_database_staged_with_options, latest_known_migration_version,
 };
 
-/// A migration version far above anything this binary will ever ship.
-const FUTURE_MIGRATION_VERSION: i64 = 999_999;
+/// A migration version far above anything this binary will ever ship. Must stay
+/// above every real version: the fork mixes sequential ids (037…) with
+/// date-based ones (e.g. `2026110201` = YYYYMMDDNN), and a date-based id already
+/// exceeds the old 999_999 sentinel — so this sits well past any YYYYMMDDNN. The
+/// value is test-only (it seeds a row to trigger sqlx `VersionMissing`, which is
+/// set-membership, not magnitude); no production path reads it.
+const FUTURE_MIGRATION_VERSION: i64 = 9_999_999_999_999;
 
 async fn seed_future_migration_row(path: &std::path::Path) {
     let db = init_database_staged(path).await.unwrap();

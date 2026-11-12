@@ -4995,24 +4995,32 @@ impl ConversationService {
             });
         }
 
+        // Cancel the active turn BEFORE marking the conversation restarting.
+        // `RuntimeRestart`, not a user stop: cancelling here is only a precondition
+        // for killing the agent process. The user wants the conversation working
+        // again, and the restart leaves it idle — so work queued FOR it must
+        // survive, not be discarded at the exact moment it became deliverable.
+        //
+        // It must run before `begin_restart`: `try_begin_cancel` refuses a cancel
+        // while the conversation is marked restarting, so issuing it afterwards
+        // silently skips `agent.cancel()` — the turn then dies only via the kill
+        // below and the graceful RuntimeRestart cancel (and its cause) never
+        // fires. The `is_restarting` guard above already rejected a concurrent
+        // restart, and the kill_and_wait + clear_turn_state_for_restart below
+        // still cover a turn that races in before begin_restart.
+        if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+            self.cancel_with_cause(
+                user_id,
+                conversation_id,
+                &turn_id,
+                task_manager,
+                TurnCancelCause::RuntimeRestart,
+            )
+            .await?;
+        }
+
         self.runtime_state.begin_restart(conversation_id)?;
         let restart_result = async {
-            if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
-                // `RuntimeRestart`, not a user stop: cancelling here is only a
-                // precondition for killing the agent process. The user wants the
-                // conversation working again, and the restart leaves it idle —
-                // so work queued FOR it must survive, not be discarded at the
-                // exact moment it became deliverable.
-                self.cancel_with_cause(
-                    user_id,
-                    conversation_id,
-                    &turn_id,
-                    task_manager,
-                    TurnCancelCause::RuntimeRestart,
-                )
-                .await?;
-            }
-
             info!(conversation_id, "Restarting conversation runtime");
             task_manager
                 .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))

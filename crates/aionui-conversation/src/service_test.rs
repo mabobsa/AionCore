@@ -7716,8 +7716,29 @@ async fn send_message_auto_replays_clean_retryable_acp_error_once() {
 
     assert_eq!(task_mgr.build_count(), 2);
     assert_eq!(task_mgr.kill_count(), 1);
-    assert_eq!(first.sent_contents(), vec!["Hello"]);
-    assert_eq!(second.sent_contents(), vec!["Hello"]);
+    // The dispatched prompt carries the appended "[AionUi choice notifications]"
+    // block, so compare the user-authored head, mirroring the sibling
+    // retryable-replay test above.
+    let first_sent = first.sent_contents();
+    assert_eq!(
+        first_sent.len(),
+        1,
+        "the original input must be dispatched exactly once"
+    );
+    assert_eq!(
+        first_sent[0].split("\n\n[AionUi choice notifications]\n").next(),
+        Some("Hello")
+    );
+    let second_sent = second.sent_contents();
+    assert_eq!(
+        second_sent.len(),
+        1,
+        "the rebuilt agent replays the original input once"
+    );
+    assert_eq!(
+        second_sent[0].split("\n\n[AionUi choice notifications]\n").next(),
+        Some("Hello")
+    );
 
     let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let users: Vec<_> = messages
