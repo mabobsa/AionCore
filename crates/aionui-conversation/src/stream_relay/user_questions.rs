@@ -121,6 +121,7 @@ impl StreamRelay {
                     status: "pending".into(),
                     created_at: row.created_at,
                     updated_at: now_ms(),
+                    restored_at: None,
                 })
                 .await;
             if let Err(error) = result {
@@ -272,6 +273,7 @@ impl StreamRelay {
                 status: "pending".into(),
                 created_at,
                 updated_at: now_ms(),
+                restored_at: None,
             })
             .await
     }

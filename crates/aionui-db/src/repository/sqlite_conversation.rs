@@ -971,6 +971,10 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn restore_choice_notice(&self, user_id: &str, key: &str, restored_at: i64) -> Result<bool, DbError> {
+        crate::fork_extensions::choice_notice_restore::restore(&self.pool, user_id, key, restored_at).await
+    }
+
     // ── Message operations ──────────────────────────────────────────
 
     async fn latest_message_of_type(

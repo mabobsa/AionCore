@@ -132,6 +132,7 @@ fn make_choice_notice(
         status: "pending".to_owned(),
         created_at,
         updated_at: created_at,
+        restored_at: None,
     }
 }
 
@@ -1889,6 +1890,85 @@ async fn choice_notices_registered_after_a_user_message_remain_until_explicitly_
     assert!(repo.dismiss_choice_notice(&delayed).await.unwrap());
     repo.upsert_choice_notice(&delayed).await.unwrap();
     assert!(repo.list_choice_notices(USER_ID).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn restoring_a_dismissed_choice_notice_marks_it_and_only_reopens_user_dismissals() {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("choice-restore");
+    repo.create(&conv).await.unwrap();
+    create_user_2(&db).await;
+
+    let dismissed = make_choice_notice(USER_ID, &conv.id, "message-a", "Restart now?", 100);
+    repo.upsert_choice_notice(&dismissed).await.unwrap();
+    assert!(repo.dismiss_choice_notice(&dismissed).await.unwrap());
+    let pending = make_choice_notice(USER_ID, &conv.id, "message-b", "Deploy now?", 200);
+    repo.upsert_choice_notice(&pending).await.unwrap();
+
+    // Another user, an unknown key and an already pending row stay untouched.
+    assert!(!repo.restore_choice_notice("user_2", &dismissed.key, 500).await.unwrap());
+    assert!(!repo.restore_choice_notice(USER_ID, "missing", 500).await.unwrap());
+    assert!(!repo.restore_choice_notice(USER_ID, &pending.key, 500).await.unwrap());
+
+    assert!(repo.restore_choice_notice(USER_ID, &dismissed.key, 500).await.unwrap());
+    let restored = repo.list_choice_notices(USER_ID).await.unwrap();
+    assert_eq!(
+        restored
+            .iter()
+            .map(|notice| (notice.key.as_str(), notice.restored_at))
+            .collect::<Vec<_>>(),
+        vec![(dismissed.key.as_str(), Some(500)), (pending.key.as_str(), None)]
+    );
+    // Replaying registration keeps the restoration mark.
+    repo.upsert_choice_notice(&dismissed).await.unwrap();
+    let replayed = repo.list_choice_notices(USER_ID).await.unwrap();
+    assert_eq!(replayed[0].restored_at, Some(500));
+    assert!(!repo.restore_choice_notice(USER_ID, &dismissed.key, 600).await.unwrap());
+}
+
+#[tokio::test]
+async fn restoring_a_choice_notice_keeps_one_pending_row_per_identical_question() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("choice-restore-duplicates");
+    repo.create(&conv).await.unwrap();
+    let older = make_choice_notice(USER_ID, &conv.id, "message-a", "Restart now?", 100);
+    let newer = make_choice_notice(USER_ID, &conv.id, "message-b", "Restart now?", 200);
+    for notice in [&older, &newer] {
+        repo.upsert_choice_notice(notice).await.unwrap();
+        assert!(repo.dismiss_choice_notice(notice).await.unwrap());
+    }
+
+    // The newer identical question replaces the older one once it is back on.
+    assert!(repo.restore_choice_notice(USER_ID, &newer.key, 300).await.unwrap());
+    assert!(!repo.restore_choice_notice(USER_ID, &older.key, 400).await.unwrap());
+    let pending = repo.list_choice_notices(USER_ID).await.unwrap();
+    assert_eq!(
+        pending.iter().map(|notice| notice.key.as_str()).collect::<Vec<_>>(),
+        vec![newer.key.as_str()]
+    );
+
+    // Restoring the newer row supersedes an older identical pending row.
+    let conv2 = make_conversation("choice-restore-supersede");
+    repo.create(&conv2).await.unwrap();
+    let pending_old = make_choice_notice(USER_ID, &conv2.id, "message-a", "Deploy?", 100);
+    let dismissed_new = make_choice_notice(USER_ID, &conv2.id, "message-b", "Deploy?", 200);
+    repo.upsert_choice_notice(&dismissed_new).await.unwrap();
+    assert!(repo.dismiss_choice_notice(&dismissed_new).await.unwrap());
+    repo.upsert_choice_notice(&pending_old).await.unwrap();
+    assert!(
+        repo.restore_choice_notice(USER_ID, &dismissed_new.key, 300)
+            .await
+            .unwrap()
+    );
+    let keys = repo
+        .list_choice_notices(USER_ID)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|notice| notice.conversation_id == conv2.id)
+        .map(|notice| notice.key)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec![dismissed_new.key.clone()]);
 }
 
 #[tokio::test]

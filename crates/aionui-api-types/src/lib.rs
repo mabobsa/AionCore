@@ -103,6 +103,7 @@ pub use claude_account::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::ReloadConversationMcpServersRequest;
+pub use conversation::RestoreChoiceNoticeRequest;
 pub use conversation::SearchMessagesMatchQuery;
 pub use conversation::{ActiveConversationRuntime, ActiveConversationRuntimesResponse};
 pub use conversation::{

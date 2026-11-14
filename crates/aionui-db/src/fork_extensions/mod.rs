@@ -1,4 +1,5 @@
 pub mod archive_retention_repository;
+pub(crate) mod choice_notice_restore;
 pub mod claude_account_usage;
 pub mod database_maintenance;
 pub mod external_dispatch_repository;

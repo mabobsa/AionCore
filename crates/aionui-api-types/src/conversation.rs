@@ -375,6 +375,14 @@ pub struct DismissChoiceNoticeRequest {
     pub created_at: TimestampMs,
 }
 
+/// Body for `POST /api/choice-notifications/restore`; the stored row keeps its preview.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RestoreChoiceNoticeRequest {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub marker_index: u32,
+}
+
 /// Query parameters for `GET /api/messages/search`.
 #[derive(Debug, Deserialize)]
 pub struct SearchMessagesQuery {
@@ -528,6 +536,9 @@ pub struct ChoiceNoticeResponse {
     pub marker_index: u32,
     pub preview: String,
     pub created_at: TimestampMs,
+    /// Set when the user turned a dismissed notice back on; clients skip mobile push for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<TimestampMs>,
 }
 
 pub type ChoiceNoticeListResponse = Vec<ChoiceNoticeResponse>;
@@ -776,7 +787,32 @@ mod tests {
             marker_index: 0,
             preview: "Restart now?".into(),
             created_at: 100,
+            restored_at: None,
         };
+        let value = serde_json::to_value(&notice).unwrap();
+        assert!(
+            value.get("restored_at").is_none(),
+            "absent restoration stays off the wire"
+        );
+        let restored: ChoiceNoticeResponse = serde_json::from_value(serde_json::json!({
+            "key": r#"["conversation-a","message-a",0]"#,
+            "conversation_id": "conversation-a",
+            "message_id": "message-a",
+            "marker_index": 0,
+            "preview": "Restart now?",
+            "created_at": 100,
+            "restored_at": 200,
+        }))
+        .unwrap();
+        assert_eq!(restored.restored_at, Some(200));
+        let restore: RestoreChoiceNoticeRequest = serde_json::from_value(serde_json::json!({
+            "conversation_id": "conversation-a",
+            "message_id": "message-a",
+            "marker_index": 0,
+        }))
+        .unwrap();
+        assert_eq!(restore.marker_index, 0);
+
         let payload = ChoiceNoticesChangedPayload {
             user_id: "user-a".into(),
             items: vec![notice],

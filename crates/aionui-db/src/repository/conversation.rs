@@ -170,6 +170,12 @@ pub trait IConversationRepository: Send + Sync {
         Ok(false)
     }
 
+    /// Turn a user-dismissed notice back on. Returns `false` when the key is not
+    /// dismissed or a newer identical question already stands for it.
+    async fn restore_choice_notice(&self, _user_id: &str, _key: &str, _restored_at: i64) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
     // ── Message operations ──────────────────────────────────────────
 
     /// Returns cursor-paginated messages for a conversation in ascending display order.

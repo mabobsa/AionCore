@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::ActiveConversationRuntimesResponse;
+use aionui_api_types::RestoreChoiceNoticeRequest;
 use aionui_api_types::SearchMessagesMatchQuery;
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
@@ -133,6 +134,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
             get(list_choice_notices).post(register_choice_notice),
         )
         .route("/api/choice-notifications/dismiss", post(dismiss_choice_notice))
+        .route("/api/choice-notifications/restore", post(restore_choice_notice))
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/mcp-servers", put(reload_mcp_servers))
@@ -236,6 +238,20 @@ async fn dismiss_choice_notice(
     let result = state
         .service
         .dismiss_choice_notice(&user.id, req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn restore_choice_notice(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RestoreChoiceNoticeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ChoiceNoticeListResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .restore_choice_notice(&user.id, req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

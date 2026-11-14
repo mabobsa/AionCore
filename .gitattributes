@@ -2,3 +2,4 @@
 *.ps1 text eol=crlf
 crates/aionui-db/migrations/2026101501_archive_retention.sql text eol=lf
 crates/aionui-db/migrations/2026110201_message_search_cursor.sql text eol=lf
+crates/aionui-db/migrations/2026111401_choice_notice_restore.sql text eol=lf

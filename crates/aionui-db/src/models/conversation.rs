@@ -78,6 +78,10 @@ pub struct ChoiceNoticeRow {
     pub status: String,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Set when the user turned a dismissed notice back on; clients skip mobile push for it.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub restored_at: Option<TimestampMs>,
 }
 
 /// Insert-or-update parameters for `conversation_assistant_snapshots`.

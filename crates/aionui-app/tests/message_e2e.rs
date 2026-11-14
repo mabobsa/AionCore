@@ -1026,6 +1026,66 @@ async fn choice_notification_writes_require_csrf() {
 }
 
 #[tokio::test]
+async fn dismissed_choice_notification_can_be_restored_once_with_a_mark() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conversation_id = create_conversation(&mut app, &token, &csrf, "Restore choice notifications").await;
+    let notice = json!({
+        "conversation_id": conversation_id,
+        "message_id": "assistant-message-1",
+        "marker_index": 0,
+        "preview": "Choose one",
+        "created_at": aionui_common::now_ms(),
+    });
+    let key = json!({
+        "conversation_id": conversation_id,
+        "message_id": "assistant-message-1",
+        "marker_index": 0,
+    });
+    let post = |path: &'static str, body: serde_json::Value| {
+        let app = app.clone();
+        let request = common::json_with_token("POST", path, body, &token, &csrf);
+        async move {
+            let resp = app.oneshot(request).await.unwrap();
+            (resp.status(), body_json(resp).await)
+        }
+    };
+
+    assert_eq!(
+        post("/api/choice-notifications", notice.clone()).await.0,
+        StatusCode::OK
+    );
+    let (status, dismissed) = post("/api/choice-notifications/dismiss", notice.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(dismissed["data"].as_array().unwrap().is_empty());
+
+    let (status, restored) = post("/api/choice-notifications/restore", key.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = restored["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["preview"], "Choose one");
+    let restored_at = items[0]["restored_at"].as_i64().expect("restored notices carry a mark");
+
+    // A second restore of the now pending notice changes nothing.
+    let (_, again) = post("/api/choice-notifications/restore", key.clone()).await;
+    assert_eq!(again["data"][0]["restored_at"].as_i64(), Some(restored_at));
+
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss2").await;
+    let foreign = app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/choice-notifications/restore",
+            key,
+            &other_token,
+            &other_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn choice_notifications_are_shared_with_the_same_user_and_isolated_from_other_users() {
     let (mut app, services) = build_app().await;
     let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

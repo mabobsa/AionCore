@@ -1,3 +1,4 @@
+mod choice_notice_restore;
 mod conversation_list;
 mod deletion;
 mod external_report;
@@ -109,6 +110,7 @@ pub(crate) fn choice_notice_row_to_response(row: ChoiceNoticeRow) -> Result<Choi
         marker_index,
         preview: row.preview,
         created_at: row.created_at,
+        restored_at: row.restored_at,
     })
 }
 
@@ -3567,6 +3569,7 @@ impl ConversationService {
             status: status.to_owned(),
             created_at: input.created_at,
             updated_at: now_ms(),
+            restored_at: None,
         })
     }
 
