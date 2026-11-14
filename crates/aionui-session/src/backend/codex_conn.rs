@@ -920,11 +920,9 @@ pub struct CodexSessionBackend {
     /// `thread/settings/update` SetMode/SetModel requests. The reader claims the
     /// response: a JSON-RPC ERROR (e.g. an invalid model/mode rejected by codex) is
     /// surfaced as a `Notice{Warning}` + error log instead of being silently dropped
-    /// (a failed set the user would never see). A SUCCESS does NOTHING here — codex
-    /// converges via the separate `thread/settings/updated` notification (handled in
-    /// `map_notification` → ConfigChanged, live-verified), so emitting here too would
-    /// duplicate the ConfigChanged. The codex analogue of acp_conn's `pending_set`.
-    pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    /// Model and effort writes wait for BOTH the RPC success and matching
+    /// thread/settings/updated notification before returning to the caller.
+    pending_set: Arc<super::codex_config::CodexConfigWrites>,
     /// B5 mid-turn delivery: rpc-id → in-flight `turn/steer` ack correlation.
     /// dispatch(Steer) inserts and AWAITS the oneshot so the caller learns the
     /// synchronous accept/reject (codex acks a steer with `{turnId}` ~0ms,
@@ -1027,7 +1025,7 @@ struct CodexReaderState {
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
-    pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_set: Arc<super::codex_config::CodexConfigWrites>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
@@ -1222,7 +1220,7 @@ impl CodexSessionBackend {
     /// live path `dispatch(SetMode/SetModel)` registers it.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn set_pending_set_for_test(&self, rpc_id: u64, label: impl Into<String>) {
-        self.pending_set.lock().await.insert(rpc_id, label.into());
+        self.pending_set.track(rpc_id, label.into()).await;
     }
 
     /// Test-support seam: register a pending `thread/resume` rpc id so a hermetic
@@ -1276,7 +1274,7 @@ impl CodexSessionBackend {
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
-        let pending_set = Arc::new(Mutex::new(HashMap::new()));
+        let pending_set = Arc::new(super::codex_config::CodexConfigWrites::default());
         let pending_steers = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
@@ -1388,6 +1386,28 @@ impl CodexSessionBackend {
             .await
             .map_err(|e| BackendError::Transport(e.to_string()))?;
         Ok(())
+    }
+
+    // Do not report a picker override as applied before Codex acknowledges the
+    // exact request AND publishes the matching settings for the same thread.
+    async fn write_confirmed_config(&self, thread: &str, field: &str, value: &str) -> Result<(), BackendError> {
+        let id = self.next_rpc_id();
+        let rx = self.pending_set.register(id, thread, field, value).await;
+        let frame = json!({
+            "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
+            "params": { "threadId": thread, (field): value }
+        });
+        if let Err(error) = self.write_frame(frame).await {
+            self.pending_set.forget(id).await;
+            return Err(error);
+        }
+        let result = self.pending_set.wait(id, rx).await;
+        if let Err(error) = &result {
+            tracing::warn!(conversation_id = %self.session_id, field, value, error = %error, "Codex config change was not confirmed");
+        } else {
+            tracing::info!(conversation_id = %self.session_id, field, value, "Codex config change confirmed");
+        }
+        result
     }
 
     fn next_rpc_id(&self) -> u64 {
@@ -1615,7 +1635,7 @@ async fn reader_task(
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
-    pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_set: Arc<super::codex_config::CodexConfigWrites>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
@@ -1925,6 +1945,9 @@ async fn reader_task(
                             }
                             continue;
                         }
+                        if m == "thread/settings/updated" {
+                            pending_set.observe(params).await;
+                        }
                         for ev in map_notification(m, params) {
                             emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
                         }
@@ -1940,6 +1963,9 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            if let Some(result) = frame.get("result") {
+                                pending_set.observe_opened(result).await;
+                            }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -2160,14 +2186,10 @@ async fn reader_task(
                             // response (dispatch registered rpc_id → "mode→<v>"/"model→<v>").
                             // A JSON-RPC ERROR (codex rejected the model/mode) is surfaced
                             // as a Notice{Warning} + error log so a FAILED set is visible
-                            // instead of being silently dropped (it used to be claimed by no
-                            // one). A SUCCESS does NOTHING here: codex converges via the
-                            // separate `thread/settings/updated` notification (→ ConfigChanged,
-                            // live-verified) — emitting a second ConfigChanged would duplicate.
-                            // On SUCCESS this does nothing: codex converges via the
-                            // separate thread/settings/updated notification (→ ConfigChanged),
-                            // so the claim only matters when the response carries an error.
-                            if let Some(label) = pending_set.lock().await.remove(&rid)
+                            // instead of being silently dropped. Model/effort dispatch waits
+                            // for this response AND matching thread/settings/updated. The
+                            // notification alone emits ConfigChanged, avoiding duplicate events.
+                            if let Some(label) = pending_set.response(rid, &frame).await
                                 && let Some(err) = frame.get("error")
                             {
                                 let message = err
@@ -4301,10 +4323,7 @@ impl SessionBackend for CodexSessionBackend {
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the profile) surfaces as a Notice instead of
                 // being dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("mode\u{2192}{profile_id}"));
+                self.pending_set.track(id, format!("mode -> {profile_id}")).await;
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": {
@@ -4320,32 +4339,13 @@ impl SessionBackend for CodexSessionBackend {
                 })
             }
             Command::SetModel { model } => {
-                // F-4: between-turn config write → wake a suspended session first.
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
-                // codex `thread/settings/update{threadId, model}` (verified frame:
-                // {"threadId":..,"model":"gpt-5.5"}). Applies to subsequent turns.
-                // Track it so a subsequent SetMode can build collaborationMode (M1).
                 let tid = self.bound_thread().await?;
+                self.write_confirmed_config(&tid, "model", &model).await?;
                 *self.current_model.lock().await = Some(model.clone());
-                // Keep the title latch on the model the user is actually talking
-                // to — a title run started after a switch must not use the stale
-                // open-time model.
-                self.reader_state.title_gen.set_model(Some(model.clone()));
-                let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC
-                // error (codex rejected the model) surfaces as a Notice instead of
-                // being dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("model\u{2192}{model}"));
-                let frame = json!({
-                    "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
-                    "params": { "threadId": tid, "model": model }
-                });
-                self.write_frame(frame).await?;
+                self.reader_state.title_gen.set_model(Some(model));
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4551,19 +4551,7 @@ impl SessionBackend for CodexSessionBackend {
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
                 let tid = self.bound_thread().await?;
-                let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC error
-                // (codex rejected the effort) surfaces as a Notice instead of being
-                // dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("effort\u{2192}{value}"));
-                let frame = json!({
-                    "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
-                    "params": { "threadId": tid, "effort": value }
-                });
-                self.write_frame(frame).await?;
+                self.write_confirmed_config(&tid, "effort", &value).await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -7502,19 +7490,66 @@ mod tests {
         assert_eq!(parse_found_turn_id("expected active turn id but found ``"), None);
     }
 
+    async fn confirmed_config_wire(thread: &str, field: &str, value: &str, command: Command) -> String {
+        let ack = json!({"jsonrpc":"2.0", "id":1, "result":{}});
+        let update = json!({"jsonrpc":"2.0", "method":"thread/settings/updated",
+            "params":{"threadId":thread, "threadSettings":{(field):value}}});
+        let fake = fake_with_binding(thread, None).with_gated_tail(format!("{ack}\n{update}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let release = fake.stdout_releaser();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("config-confirm", Box::new(fake)).await);
+        let pending = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.dispatch(command).await })
+        };
+        let written = captured_str(&captured).await;
+        assert!(!pending.is_finished(), "dispatch must wait for Codex confirmation");
+        release();
+        let receipt = pending.await.unwrap().expect("confirmed config");
+        assert_eq!(receipt.admission, Admission::NoTurn);
+        assert_eq!(receipt.turn_gen, 0, "config changes do not start a new turn");
+        assert!(!written.contains("thread/start") && !written.contains("thread/fork"));
+        written
+    }
+
+    #[tokio::test]
+    async fn config_rejection_reaches_the_caller_without_updating_selected_model() {
+        let fake = fake_with_binding("th-reject", None)
+            .with_gated_tail(b"{\"id\":1,\"error\":{\"code\":-32602,\"message\":\"model rejected\"}}\n".to_vec());
+        let captured = fake.captured_stdin();
+        let release = fake.stdout_releaser();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("config-reject", Box::new(fake)).await);
+        *backend.current_model.lock().await = Some("previous".into());
+        let dispatch = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                backend
+                    .dispatch(Command::SetModel {
+                        model: "unavailable".into(),
+                    })
+                    .await
+            })
+        };
+        assert!(captured_str(&captured).await.contains("thread/settings/update"));
+        release();
+        assert!(
+            matches!(dispatch.await.unwrap(), Err(BackendError::Transport(message)) if message == "model rejected")
+        );
+        assert_eq!(backend.current_model.lock().await.as_deref(), Some("previous"));
+    }
+
     #[tokio::test]
     async fn dispatch_set_model_writes_thread_settings_update() {
         // R6 SetModel → `thread/settings/update{threadId, model}` (verified frame).
-        let fake = fake_with_binding("th-5", None);
-        let captured = fake.captured_stdin();
-        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-        backend
-            .dispatch(Command::SetModel {
+        let written = confirmed_config_wire(
+            "th-5",
+            "model",
+            "gpt-5.5",
+            Command::SetModel {
                 model: "gpt-5.5".into(),
-            })
-            .await
-            .expect("accepted");
-        let written = captured_str(&captured).await;
+            },
+        )
+        .await;
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
             "wrote thread/settings/update, got: {written}"
@@ -7536,17 +7571,16 @@ mod tests {
         // so SetConfigOption{effort} routes through the same wire as SetModel/SetMode —
         // NOT a CommandNotSupported reject. Each effort alias id maps to the `effort` key.
         for option_id in ["effort", "reasoning_effort", "thought_level"] {
-            let fake = fake_with_binding("th-7", None);
-            let captured = fake.captured_stdin();
-            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-            backend
-                .dispatch(Command::SetConfigOption {
+            let written = confirmed_config_wire(
+                "th-7",
+                "effort",
+                "high",
+                Command::SetConfigOption {
                     option_id: option_id.into(),
                     value: "high".into(),
-                })
-                .await
-                .unwrap_or_else(|e| panic!("effort id `{option_id}` must be accepted, got: {e:?}"));
-            let written = captured_str(&captured).await;
+                },
+            )
+            .await;
             assert!(
                 written.contains(r#""method":"thread/settings/update""#),
                 "id `{option_id}` wrote thread/settings/update, got: {written}"
@@ -8887,8 +8921,19 @@ mod tests {
     #[tokio::test]
     async fn codex_model_reconcile_applies_valid_model() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
-        reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
+        let reconcile = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
+            })
+        };
         let written = captured_str(&captured).await;
+        backend.pending_set.response(1, &json!({"result":{}})).await;
+        backend
+            .pending_set
+            .observe(&json!({"threadId":"th-rec", "threadSettings":{"model":"openai.gpt-5.4"}}))
+            .await;
+        reconcile.await.unwrap();
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
             "a catalog-valid model is applied via thread/settings/update, got: {written}"
