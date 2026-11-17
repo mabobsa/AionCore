@@ -273,6 +273,8 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         runtime_token_verifier: None,
     };
 
+    let webui_session = crate::webui_session::routes(auth_state.clone(), state.local);
+
     // Auth rate limited routes (login, qr-login)
     let auth_rate_limited = Router::new()
         .route("/login", post(login_handler))
@@ -362,6 +364,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let static_routes = Router::new().route("/qr-login", get(qr_login_page));
 
     Router::new()
+        .merge(webui_session)
         .merge(auth_rate_limited)
         .merge(api_public)
         .merge(authenticated)

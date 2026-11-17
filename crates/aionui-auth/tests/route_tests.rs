@@ -1300,3 +1300,147 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     assert_eq!(renamed_json["data"]["id"], user_id);
     assert_eq!(renamed_json["data"]["username"], "renamed-admin");
 }
+
+#[cfg(test)]
+mod webui_session_tests {
+    use super::*;
+
+    async fn probe(app: Router, token: Option<&str>) -> StatusCode {
+        let mut request = Request::get("/api/auth/webui-session");
+        if let Some(token) = token {
+            request = request.header(header::COOKIE, format!("aionui-session={token}"));
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn local_backend_requires_a_real_access_session() {
+        let (app, ctx) = test_app_with_local(true).await;
+        assert_eq!(probe(app.clone(), None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(probe(app.clone(), Some("forged")).await, StatusCode::UNAUTHORIZED);
+        let refresh = ctx.jwt_service.sign_refresh("system_default_user", "admin", 0).unwrap();
+        assert_eq!(probe(app.clone(), Some(&refresh)).await, StatusCode::UNAUTHORIZED);
+        let token = ctx.jwt_service.sign("system_default_user", "admin").unwrap();
+        assert_eq!(probe(app.clone(), Some(&token)).await, StatusCode::NO_CONTENT);
+        ctx.jwt_service.blacklist_token(&token);
+        assert_eq!(probe(app, Some(&token)).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stale_disabled_missing_and_other_users_cannot_authorize_local_data() {
+        let (app, ctx) = test_app_with_local(true).await;
+        let user = ctx.user_repo.create_user("other", "unused").await.unwrap();
+        let other = ctx.jwt_service.sign(&user.id, "other").unwrap();
+        assert_eq!(probe(app.clone(), Some(&other)).await, StatusCode::FORBIDDEN);
+        let missing = ctx.jwt_service.sign("missing", "missing").unwrap();
+        assert_eq!(probe(app.clone(), Some(&missing)).await, StatusCode::UNAUTHORIZED);
+        let token = ctx.jwt_service.sign("system_default_user", "admin").unwrap();
+        ctx.user_repo
+            .increment_session_generation("system_default_user")
+            .await
+            .unwrap();
+        assert_eq!(probe(app.clone(), Some(&token)).await, StatusCode::UNAUTHORIZED);
+        let current = ctx
+            .jwt_service
+            .sign_with_session_generation("system_default_user", "admin", 1)
+            .unwrap();
+        ctx.user_repo
+            .set_status("system_default_user", UserStatus::Disabled)
+            .await
+            .unwrap();
+        assert_eq!(probe(app, Some(&current)).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn expired_access_and_helper_credentials_are_rejected() {
+        let (app, _) = test_app_with_local(true).await;
+        let claims = serde_json::json!({"user_id":"system_default_user", "username":"admin", "iat":1, "exp":2, "iss":"aionui", "aud":"aionui-webui"});
+        let expired = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"test_secret_for_routes"),
+        )
+        .unwrap();
+        assert_eq!(probe(app.clone(), Some(&expired)).await, StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::get("/api/auth/webui-session")
+                    .header("x-aionui-runtime-token", "helper")
+                    .header("x-aionui-user-id", "system_default_user")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn password_and_qr_sessions_authorize_the_probe_and_logout_revokes_access() {
+        let (app, ctx) = test_app_with_local(true).await;
+        create_test_user(&ctx, "admin", "TestPassword123!").await;
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                "/login",
+                r#"{"username":"admin","password":"TestPassword123!"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with("aionui-session="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let token = cookie.strip_prefix("aionui-session=").unwrap();
+        assert_eq!(probe(app.clone(), Some(token)).await, StatusCode::NO_CONTENT);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/logout")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(probe(app.clone(), Some(token)).await, StatusCode::UNAUTHORIZED);
+        let (app, ctx) = test_app_with_local(true).await;
+        let qr = ctx.qr_token_store.generate();
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                "/api/auth/qr-login",
+                &serde_json::json!({"qr_token":qr}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with("aionui-session="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            probe(app, cookie.strip_prefix("aionui-session=")).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+}

@@ -17,6 +17,7 @@ mod security;
 mod service;
 mod singleflight;
 mod validation;
+mod webui_session;
 
 // Error type
 pub use error::AuthError;
