@@ -471,8 +471,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     );
 
     if services.identity_mode.is_local() {
+        // Fork: local mode has no authentication, so only this machine's app may
+        // reach it from a browser context (see `aionui_auth::local_origin_guard`).
         let cors = CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(AllowOrigin::predicate(|origin, _| {
+                aionui_auth::is_allowed_local_origin(origin)
+            }))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -482,7 +486,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 Method::OPTIONS,
             ])
             .allow_headers(Any);
-        router.layer(cors)
+        router
+            .layer(middleware::from_fn(aionui_auth::local_origin_guard))
+            .layer(cors)
     } else {
         // Non-local (external identity) mode: the desktop renderer is a
         // cross-origin browser context (localhost:5173 in dev, file:// when

@@ -7,6 +7,7 @@ mod csrf;
 mod error;
 mod extract;
 mod jwt;
+mod local_origin;
 pub mod middleware;
 mod password;
 pub mod qr_token;
@@ -62,6 +63,9 @@ pub use security::security_headers_middleware;
 
 // CSRF protection
 pub use csrf::csrf_middleware;
+
+// Local-mode browser boundary (fork)
+pub use local_origin::{is_allowed_local_origin, local_origin_guard};
 
 // Auth middleware
 pub use middleware::{
