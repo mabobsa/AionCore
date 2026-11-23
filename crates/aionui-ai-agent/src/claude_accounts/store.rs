@@ -35,6 +35,34 @@ pub struct ClaudeAccountStore {
     cache: Mutex<Option<Vec<StoredAccount>>>,
 }
 
+/// Account validation shared by features that create Claude conversations.
+#[async_trait::async_trait]
+pub trait IClaudeAccountSelection: Send + Sync {
+    async fn validate_selection(&self, account_id: Option<&str>) -> Result<Option<String>, AgentError>;
+}
+
+#[async_trait::async_trait]
+impl IClaudeAccountSelection for ClaudeAccountStore {
+    async fn validate_selection(&self, account_id: Option<&str>) -> Result<Option<String>, AgentError> {
+        let Some(id) = account_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && *id != aionui_api_types::DEFAULT_CLAUDE_ACCOUNT_ID)
+        else {
+            return Ok(None);
+        };
+        let accounts = self.load().await?;
+        if accounts.len() < 2 {
+            return Err(AgentError::bad_request(
+                "Claude account selection requires at least two accounts",
+            ));
+        }
+        if !accounts.iter().any(|account| account.id == id) {
+            return Err(AgentError::bad_request(format!("Claude account '{id}' was not found")));
+        }
+        Ok(Some(id.to_owned()))
+    }
+}
+
 impl ClaudeAccountStore {
     pub fn new(path: PathBuf) -> Self {
         Self {
@@ -144,6 +172,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ClaudeAccountStore::in_data_dir(dir.path());
         assert!(store.load().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn selection_keeps_default_unset_and_rejects_single_account_overrides() {
+        for count in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = ClaudeAccountStore::in_data_dir(dir.path());
+            if count == 1 {
+                write_file(&store.path, &[account("default", None)]).await.unwrap();
+            }
+            for id in [None, Some(""), Some(" default ")] {
+                assert_eq!(store.validate_selection(id).await.unwrap(), None);
+            }
+            let error = store.validate_selection(Some("max")).await.unwrap_err();
+            assert!(error.to_string().contains("at least two accounts"));
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_accepts_only_registered_ids_and_rejects_removed_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClaudeAccountStore::in_data_dir(dir.path());
+        store
+            .update(|accounts| {
+                accounts.extend([account("default", None), account("max", Some("C:/max"))]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.validate_selection(Some(" max ")).await.unwrap().as_deref(),
+            Some("max")
+        );
+        assert!(
+            store
+                .validate_selection(Some("gone"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("was not found")
+        );
+        store
+            .update(|accounts| {
+                accounts.retain(|account| account.id == "default");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .validate_selection(Some("max"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("at least two accounts")
+        );
     }
 
     #[tokio::test]

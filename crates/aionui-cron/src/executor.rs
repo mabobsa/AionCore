@@ -642,6 +642,7 @@ impl JobExecutor {
         info!(
             job_id = %job.id,
             conversation_id = %response.id,
+            claude_account_id = ?response.extra.get("claude_account_id").and_then(|value| value.as_str()),
             "Created new conversation for cron job"
         );
 
@@ -1260,6 +1261,12 @@ async fn build_conversation_extra(
         {
             extra.insert("workspace".to_owned(), serde_json::Value::String(workspace.clone()));
         }
+        if let Some(account_id) = &config.claude_account_id {
+            extra.insert(
+                "claude_account_id".to_owned(),
+                serde_json::Value::String(account_id.clone()),
+            );
+        }
     }
 
     serde_json::Value::Object(extra)
@@ -1366,6 +1373,7 @@ mod tests {
             message: "do something".into(),
             execution_mode: ExecutionMode::Existing,
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "Claude".into(),
                 cli_path: Some("/usr/bin/claude".into()),
                 is_preset: None,
@@ -1725,6 +1733,7 @@ mod tests {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "OpenAI".into(),
                 cli_path: None,
                 is_preset: None,
@@ -1752,6 +1761,7 @@ mod tests {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "OpenAI".into(),
                 cli_path: None,
                 is_preset: None,
@@ -1791,6 +1801,7 @@ mod tests {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "Bogus".into(),
                 cli_path: None,
                 is_preset: None,
@@ -1885,6 +1896,22 @@ mod tests {
         assert_eq!(extra["cron_job_id"], "cron_test1");
         assert_eq!(extra["exclude_auto_inject_skills"], serde_json::json!(["cron"]));
         assert!(extra.get("preset_enabled_skills").is_none());
+        assert!(extra.get("claude_account_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn new_and_replacement_conversations_preserve_the_scheduled_claude_account() {
+        let registry = hydrated_registry().await;
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().claude_account_id = Some("max".into());
+        for purpose in [
+            ConversationPurpose::NewConversationExecution,
+            ConversationPurpose::ExistingReplacement,
+        ] {
+            let extra = build_conversation_extra(&registry, &job, None, purpose).await;
+            let typed: aionui_api_types::AcpBuildExtra = serde_json::from_value(extra).unwrap();
+            assert_eq!(typed.claude_account_id.as_deref(), Some("max"));
+        }
     }
 
     #[tokio::test]

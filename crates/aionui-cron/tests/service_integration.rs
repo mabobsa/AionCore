@@ -959,6 +959,9 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
     let skill_repo: Arc<dyn aionui_db::ISkillRepository> = Arc::new(SqliteSkillRepository::new(pool.clone()));
     let svc = CronService::new(CronServiceDeps {
+        claude_accounts: Arc::new(aionui_ai_agent::claude_accounts::ClaudeAccountStore::in_data_dir(
+            &data_dir,
+        )),
         repo: cron_repo.clone(),
         agent_metadata_repo: agent_metadata_repo.clone(),
         assistant_definition_repo: assistant_definition_repo.clone(),
@@ -1004,6 +1007,19 @@ async fn setup_with_assistant_repos() -> (
     Arc<dyn IAssistantDefinitionRepository>,
     Arc<dyn IAssistantOverlayRepository>,
 ) {
+    setup_with_assistant_repos_in(tempfile::tempdir().unwrap().keep()).await
+}
+
+async fn setup_with_assistant_repos_in(
+    data_dir: std::path::PathBuf,
+) -> (
+    CronService,
+    Arc<dyn ICronRepository>,
+    Arc<MockBroadcaster>,
+    Arc<StubConvRepo>,
+    Arc<dyn IAssistantDefinitionRepository>,
+    Arc<dyn IAssistantOverlayRepository>,
+) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
     seed_sqlite_conversations(&db, &["conv_1"]).await;
@@ -1018,9 +1034,6 @@ async fn setup_with_assistant_repos() -> (
         Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
     let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let bc = Arc::new(MockBroadcaster::new());
-    let data_dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", now_ms()));
-    std::fs::create_dir_all(&data_dir).unwrap();
-
     struct StubSkillResolver;
     #[async_trait::async_trait]
     impl aionui_conversation::skill_resolver::SkillResolver for StubSkillResolver {
@@ -1066,6 +1079,9 @@ async fn setup_with_assistant_repos() -> (
     let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
     let svc = CronService::new(CronServiceDeps {
+        claude_accounts: Arc::new(aionui_ai_agent::claude_accounts::ClaudeAccountStore::in_data_dir(
+            &data_dir,
+        )),
         repo: cron_repo.clone(),
         agent_metadata_repo,
         assistant_definition_repo: assistant_definition_repo.clone(),
@@ -1097,6 +1113,124 @@ async fn setup_with_assistant_repos() -> (
     )
 }
 
+fn write_claude_accounts(data_dir: &std::path::Path) {
+    std::fs::write(
+        data_dir.join("claude-accounts.json"),
+        serde_json::json!({
+            "version": 1,
+            "accounts": [
+                { "id": "default", "label": "Team", "share_default_settings": true },
+                { "id": "max", "label": "Max", "config_dir": data_dir.join("max"), "share_default_settings": true }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn claude_account_is_persisted_and_used_when_scheduled_conversations_are_created() {
+    for mode in ["new_conversation", "existing"] {
+        let dir = tempfile::tempdir().unwrap();
+        write_claude_accounts(dir.path());
+        let (svc, repo, _, conversations, _, _) = setup_with_assistant_repos_in(dir.path().to_path_buf()).await;
+        let mut req = make_create_req("Account task", every_60s());
+        req.execution_mode = Some("new_conversation".into());
+        req.conversation_id.clear();
+        req.agent_config.as_mut().unwrap().claude_account_id = Some("max".into());
+        let job = svc.add_job("u1", req).await.unwrap();
+        let restored = svc.get_job("u1", &job.id).await.unwrap();
+        let response = serde_json::to_value(CronService::to_response(&restored)).unwrap();
+        assert_eq!(response["metadata"]["agent_config"]["claude_account_id"], "max");
+
+        if mode == "existing" {
+            // An existing-mode job can recreate its conversation after the owned anchor is deleted.
+            let mut previous = conversations.get("u1", "conv_1").await.unwrap().unwrap();
+            previous.id = "missing-previous-claude-conversation".into();
+            conversations.create(&previous).await.unwrap();
+            repo.update_for_user(
+                "u1",
+                &job.id,
+                &aionui_db::UpdateCronJobParams {
+                    execution_mode: Some("existing".into()),
+                    conversation_id: Some(previous.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            SqliteConversationRepository::new(conversations.sqlite_pool.clone())
+                .delete("u1", &previous.id)
+                .await
+                .unwrap();
+            conversations.rows.lock().unwrap().remove(&previous.id);
+        }
+
+        let run = svc.run_now("u1", &job.id).await.unwrap();
+        let conversation = conversations.get("u1", &run.conversation_id).await.unwrap().unwrap();
+        let extra: serde_json::Value = serde_json::from_str(&conversation.extra).unwrap();
+        assert_eq!(extra["claude_account_id"], "max", "mode={mode}");
+        if mode == "existing" {
+            let again = svc.run_now("u1", &job.id).await.unwrap();
+            assert_eq!(again.conversation_id, run.conversation_id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_account_updates_survive_reload_and_can_return_to_default() {
+    let dir = tempfile::tempdir().unwrap();
+    write_claude_accounts(dir.path());
+    let (svc, _, _, _, _, _) = setup_with_assistant_repos_in(dir.path().to_path_buf()).await;
+    let mut req = make_create_req("Account update", every_60s());
+    req.execution_mode = Some("new_conversation".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+    for account_id in ["max", "default"] {
+        let update = serde_json::from_value(serde_json::json!({
+            "agent_config": {
+                "name": "Claude", "assistant_id": "assistant-default", "claude_account_id": account_id
+            }
+        }))
+        .unwrap();
+        svc.update_job("u1", &job.id, update).await.unwrap();
+        let restored = svc.get_job("u1", &job.id).await.unwrap();
+        assert_eq!(
+            restored.agent_config.unwrap().claude_account_id.as_deref(),
+            (account_id == "max").then_some("max")
+        );
+    }
+}
+
+#[tokio::test]
+async fn claude_account_selection_rejects_unknown_ids_single_accounts_and_other_assistants() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _, _, _, _, _) = setup_with_assistant_repos_in(dir.path().to_path_buf()).await;
+    let mut req = make_create_req("Single account", every_60s());
+    req.agent_config.as_mut().unwrap().claude_account_id = Some("max".into());
+    let error = svc.add_job("u1", req).await.unwrap_err();
+    assert!(
+        matches!(error, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("at least two accounts"))
+    );
+
+    write_claude_accounts(dir.path());
+    let (svc, _, _, _, definitions, _) = setup_with_assistant_repos_in(dir.path().to_path_buf()).await;
+    let mut req = make_create_req("Missing account", every_60s());
+    req.agent_config.as_mut().unwrap().claude_account_id = Some("missing".into());
+    let error = svc.add_job("u1", req).await.unwrap_err();
+    assert!(
+        matches!(error, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("was not found"))
+    );
+
+    seed_assistant_definition(&definitions, "codex-definition", "codex-assistant", "codex").await;
+    let mut req = make_create_req("Wrong backend", every_60s());
+    req.agent_config.as_mut().unwrap().assistant_id = Some("codex-assistant".into());
+    req.agent_config.as_mut().unwrap().claude_account_id = Some("max".into());
+    let error = svc.add_job("u1", req).await.unwrap_err();
+    assert!(
+        matches!(error, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("requires a Claude assistant"))
+    );
+}
+
 fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobRequest {
     CreateCronJobRequest {
         name: name.into(),
@@ -1110,6 +1244,7 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
         execution_mode: None,
         queue_enabled: false,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: None,
             name: "Default Assistant".into(),
             cli_path: None,
             assistant_id: Some("assistant-default".into()),
@@ -1137,6 +1272,7 @@ fn make_cron_row_with_workspace(id: &str, user_id: &str, conversation_id: &str, 
         execution_mode: "existing".into(),
         agent_config: Some(
             serde_json::to_string(&CronAgentConfig {
+                claude_account_id: None,
                 name: "Default Assistant".into(),
                 cli_path: None,
                 is_preset: None,
@@ -1313,6 +1449,7 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
     seed_assistant_definition(&definition_repo, "asstdef_assistant_1", "assistant-1", "claude").await;
     let mut req = make_create_req("Assistant Only Create", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        claude_account_id: None,
         name: "Helper".into(),
         cli_path: None,
         assistant_id: Some("assistant-1".into()),
@@ -1349,6 +1486,7 @@ async fn create_job_derives_assistant_runtime_without_backend_hint() {
 
     let mut req = make_create_req("Stale Backend Hint", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        claude_account_id: None,
         name: "Stale Backend Hint".into(),
         cli_path: None,
         assistant_id: Some("assistant-default".into()),
@@ -1382,6 +1520,7 @@ async fn create_job_derives_runtime_type_from_aionrs_assistant() {
 
     let mut req = make_create_req("Assistant Aionrs", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        claude_account_id: None,
         name: "Aionrs Assistant".into(),
         cli_path: None,
         assistant_id: Some("assistant-aionrs".into()),
@@ -1415,6 +1554,7 @@ async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
 
     let mut req = make_create_req("Assistant Override", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        claude_account_id: None,
         name: "Override Assistant".into(),
         cli_path: None,
         assistant_id: Some("assistant-override".into()),
@@ -1441,6 +1581,7 @@ async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
 
     let mut req = make_create_req("Assistant Without Backend", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        claude_account_id: None,
         name: "Helper".into(),
         cli_path: None,
         assistant_id: Some("assistant-2".into()),
@@ -1464,6 +1605,7 @@ async fn create_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
 
     let mut req = make_create_req("Assistant Missing", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        claude_account_id: None,
         name: "Helper".into(),
         cli_path: None,
         assistant_id: Some("missing-assistant".into()),
@@ -1698,6 +1840,7 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
         message: None,
         execution_mode: None,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: None,
             name: "Other Assistant".into(),
             cli_path: None,
             assistant_id: Some("assistant-default".into()),
@@ -1737,6 +1880,7 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
         message: None,
         execution_mode: Some("new_conversation".into()),
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: None,
             name: "Other Assistant".into(),
             cli_path: None,
             assistant_id: Some("assistant-default".into()),
@@ -1948,6 +2092,7 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         message: None,
         execution_mode: Some("new_conversation".into()),
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: None,
             name: "Helper".into(),
             cli_path: None,
             assistant_id: Some("assistant-1".into()),
@@ -1985,6 +2130,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
         message: None,
         execution_mode: Some("new_conversation".into()),
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: None,
             name: "Helper".into(),
             cli_path: None,
             assistant_id: Some("missing-assistant".into()),

@@ -1064,6 +1064,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     ));
     let assistant_overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone()));
     let cron_service = Arc::new(aionui_cron::service::CronService::new(CronServiceDeps {
+        claude_accounts: services.fork_integrations.claude_account_selection.clone(),
         repo: cron_repo,
         agent_metadata_repo,
         assistant_definition_repo,

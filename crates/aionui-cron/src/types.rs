@@ -127,6 +127,8 @@ impl FromStr for JobStatus {
 pub struct CronAgentConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_preset: Option<bool>,
@@ -339,6 +341,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
         let canonical_assistant_id = c.assistant_id.clone().or_else(|| c.custom_agent_id.clone());
         let assistant_backed = canonical_assistant_id.is_some();
         CronAgentConfigReadDto {
+            claude_account_id: c.claude_account_id.clone(),
             name: c.name.clone(),
             cli_path: if assistant_backed { None } else { c.cli_path.clone() },
             is_preset: if assistant_backed { None } else { c.is_preset },
@@ -600,6 +603,7 @@ mod tests {
             message: "do something".into(),
             execution_mode: ExecutionMode::Existing,
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "Claude".into(),
                 cli_path: None,
                 is_preset: None,
@@ -833,6 +837,7 @@ mod tests {
     fn domain_to_dto_strips_legacy_agent_fields_for_assistant_backed_jobs() {
         let job = CronJob {
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "文件规划助手".into(),
                 cli_path: Some("/tmp/codex".into()),
                 is_preset: Some(true),
@@ -880,6 +885,7 @@ mod tests {
     fn domain_to_dto_promotes_legacy_custom_agent_id_to_assistant_id() {
         let job = CronJob {
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "Legacy Assistant Job".into(),
                 cli_path: Some("/tmp/claude".into()),
                 is_preset: Some(false),
@@ -907,6 +913,7 @@ mod tests {
         let job = CronJob {
             agent_type: "aionrs".into(),
             agent_config: Some(CronAgentConfig {
+                claude_account_id: None,
                 name: "Gemini Bare Assistant".into(),
                 cli_path: None,
                 is_preset: None,

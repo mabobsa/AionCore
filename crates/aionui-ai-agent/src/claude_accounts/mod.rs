@@ -21,7 +21,7 @@ use crate::error::AgentError;
 
 pub use routes::{ClaudeAccountRouterState, claude_account_routes};
 pub use service::{ClaudeAccountService, IClaudeAccountUsage};
-pub use store::{CLAUDE_ACCOUNTS_FILE, ClaudeAccountStore};
+pub use store::{CLAUDE_ACCOUNTS_FILE, ClaudeAccountStore, IClaudeAccountSelection};
 
 pub(crate) use session::SessionAccount;
 

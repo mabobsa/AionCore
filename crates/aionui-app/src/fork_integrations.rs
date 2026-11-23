@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use aionui_ai_agent::claude_accounts::{
-    ClaudeAccountRouterState, ClaudeAccountService, ClaudeAccountStore, IClaudeAccountUsage, claude_account_routes,
-    install_store,
+    ClaudeAccountRouterState, ClaudeAccountService, ClaudeAccountStore, IClaudeAccountSelection, IClaudeAccountUsage,
+    claude_account_routes, install_store,
 };
 use aionui_ai_agent::error::AgentError;
 use aionui_api_types::SessionSendMessageResponse;
@@ -30,6 +30,7 @@ use axum::Router;
 use axum::middleware::from_fn_with_state;
 
 pub(crate) struct ForkIntegrationServices {
+    pub(crate) claude_account_selection: Arc<dyn IClaudeAccountSelection>,
     mindnprogress_navigation: Arc<MindNProgressNavigationService>,
     claude_accounts: Arc<ClaudeAccountService>,
     /// Set by [`ForkIntegrationServices::attach_session_messages`] once the upstream service exists.
@@ -64,6 +65,7 @@ pub(crate) fn build_fork_integration_services(
     install_store(claude_account_store.clone());
 
     Ok(ForkIntegrationServices {
+        claude_account_selection: claude_account_store.clone(),
         mindnprogress_navigation: Arc::new(MindNProgressNavigationService::new(
             conversation_repo,
             mcp_server_repo,

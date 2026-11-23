@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use aionui_ai_agent::claude_accounts::IClaudeAccountSelection;
 use aionui_api_types::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse,
     CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
@@ -52,6 +53,7 @@ const RUN_LEASE_HEARTBEAT_MS: u64 = 20_000;
 const RUN_HISTORY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 #[derive(Clone)]
 pub struct CronService {
+    claude_accounts: Arc<dyn IClaudeAccountSelection>,
     repo: Arc<dyn ICronRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
@@ -65,6 +67,7 @@ pub struct CronService {
 }
 
 pub struct CronServiceDeps {
+    pub claude_accounts: Arc<dyn IClaudeAccountSelection>,
     pub repo: Arc<dyn ICronRepository>,
     pub agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     pub assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
@@ -79,6 +82,7 @@ pub struct CronServiceDeps {
 impl CronService {
     pub fn new(deps: CronServiceDeps) -> Self {
         Self {
+            claude_accounts: deps.claude_accounts,
             repo: deps.repo,
             agent_metadata_repo: deps.agent_metadata_repo,
             assistant_definition_repo: deps.assistant_definition_repo,
@@ -1841,6 +1845,9 @@ impl CronService {
             }
         };
         let agent_config = aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: (backend == "claude")
+                .then(|| get_string(&extra, &["claude_account_id"]))
+                .flatten(),
             name: assistant_name
                 .or_else(|| get_string(&extra, &["agent_name", "agentName"]))
                 .unwrap_or_else(|| row.name.clone()),
@@ -1906,7 +1913,26 @@ impl CronService {
             )
             .await?;
 
+        let claude_account_id = if assistant_backend == "claude" {
+            self.claude_accounts
+                .validate_selection(config.claude_account_id.as_deref())
+                .await
+                .map_err(|error| CronError::InvalidAgentConfig(error.to_string()))?
+        } else {
+            if config
+                .claude_account_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+            {
+                return Err(CronError::InvalidAgentConfig(
+                    "Claude account selection requires a Claude assistant".into(),
+                ));
+            }
+            None
+        };
+
         Ok(CronAgentConfig {
+            claude_account_id,
             name: config.name,
             cli_path: config.cli_path,
             is_preset: None,
@@ -2475,6 +2501,7 @@ mod tests {
 
     fn agent_cfg_dto(provider_id: &str) -> aionui_api_types::CronAgentConfigWriteDto {
         aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: None,
             name: "provider".into(),
             cli_path: None,
             assistant_id: Some("assistant-1".into()),
@@ -2527,6 +2554,7 @@ mod tests {
     #[test]
     fn sanitize_agent_config_dto_clears_legacy_ids_when_assistant_id_present() {
         let config = aionui_api_types::CronAgentConfigWriteDto {
+            claude_account_id: None,
             name: "Helper".into(),
             cli_path: None,
             assistant_id: Some("assistant-1".into()),
@@ -2683,6 +2711,7 @@ mod tests {
     fn build_update_params_strips_legacy_ids_when_assistant_id_present() {
         let mut job = sample_job();
         job.agent_config = Some(CronAgentConfig {
+            claude_account_id: None,
             name: "Helper".into(),
             cli_path: None,
             is_preset: None,
@@ -2702,6 +2731,7 @@ mod tests {
             message: None,
             execution_mode: None,
             agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+                claude_account_id: None,
                 name: "Helper".into(),
                 cli_path: None,
                 assistant_id: Some("assistant-1".into()),

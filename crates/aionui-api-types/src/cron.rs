@@ -39,6 +39,9 @@ pub enum CronScheduleDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CronAgentConfigReadDto {
     pub name: String,
+    /// Fork: non-default Claude account used for newly created conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +66,8 @@ pub struct CronAgentConfigReadDto {
 #[serde(deny_unknown_fields)]
 pub struct CronAgentConfigWriteDto {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,6 +532,7 @@ mod tests {
     #[test]
     fn agent_config_serialize_omits_none() {
         let c = CronAgentConfigReadDto {
+            claude_account_id: None,
             name: "Test".into(),
             cli_path: None,
             is_preset: None,
@@ -547,6 +553,7 @@ mod tests {
     #[test]
     fn agent_config_roundtrip() {
         let c = CronAgentConfigReadDto {
+            claude_account_id: None,
             name: "Agent".into(),
             cli_path: Some("/bin/x".into()),
             is_preset: Some(false),
@@ -594,6 +601,7 @@ mod tests {
                 created_at: 1700000000000,
                 updated_at: 1700001000000,
                 agent_config: Some(CronAgentConfigReadDto {
+                    claude_account_id: None,
                     name: "Claude".into(),
                     cli_path: None,
                     is_preset: None,
