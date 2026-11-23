@@ -42,6 +42,12 @@ pub struct RemoteSessionDelivery {
     pub request: RemoteSessionRelayRequest,
     /// Display label of the sender's machine.
     pub from_machine: String,
+    #[serde(default)]
+    pub from_machine_id: Option<String>,
+    #[serde(default)]
+    pub from_machine_role: Option<String>,
+    #[serde(default)]
+    pub from_conversation_url: Option<String>,
 }
 
 #[async_trait]
@@ -117,7 +123,13 @@ impl SessionMessageService {
         if !self.is_enabled_for(user_id).await {
             return Err(SessionMessageError::FeatureDisabled);
         }
-        let RemoteSessionDelivery { request, from_machine } = delivery;
+        let RemoteSessionDelivery {
+            request,
+            from_machine,
+            from_machine_id,
+            from_machine_role,
+            from_conversation_url,
+        } = delivery;
         let from = request.from_conversation_id.trim();
         let to = request.to.trim();
         if from.is_empty() || to.is_empty() || to == "*" || request.message.trim().is_empty() {
@@ -156,6 +168,18 @@ impl SessionMessageService {
             &remote_workspace_field(request.from_workspace.as_deref(), &from_machine),
             from,
         );
+        // A JSON line preserves machine labels without allowing them to inject
+        // additional envelope fields. A null URL still identifies a remote
+        // conversation, so the renderer must never navigate to a local ID.
+        let source = serde_json::json!({
+            "machineId": from_machine_id,
+            "machineName": from_machine,
+            "machineRole": from_machine_role.filter(|role| matches!(role.as_str(), "main" | "sub")),
+            "externalUrl": from_conversation_url,
+        });
+        let source_line = format!("source: {source}\n");
+        let (first_line, rest) = block.split_once('\n').expect("session block starts with a marker line");
+        let block = format!("{first_line}\n{source_line}{rest}");
         let content = compose_delivery_content(&block, &request.message);
         match self.deliver_now(user_id, to, content.clone()).await {
             Ok(sent) => {

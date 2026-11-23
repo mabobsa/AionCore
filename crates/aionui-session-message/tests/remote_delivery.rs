@@ -51,6 +51,9 @@ fn delivery(from: &str, to: &str, message: &str) -> RemoteSessionDelivery {
             message: message.to_owned(),
         },
         from_machine: "Main PC".to_owned(),
+        from_machine_id: None,
+        from_machine_role: None,
+        from_conversation_url: None,
     }
 }
 
@@ -133,6 +136,53 @@ async fn a_relayed_message_is_delivered_with_the_sender_machine_in_the_block() {
         "{content}"
     );
     assert!(content.trim_end().ends_with("hi from main"), "{content}");
+    let source = source_metadata(&content);
+    assert_eq!(source["machineName"], "Main PC");
+    assert!(source["externalUrl"].is_null());
+}
+
+fn source_metadata(content: &str) -> serde_json::Value {
+    let source = content
+        .lines()
+        .find_map(|line| line.strip_prefix("source: "))
+        .expect("remote source metadata");
+    serde_json::from_str(source).expect("valid source JSON")
+}
+
+#[tokio::test]
+async fn relayed_messages_persist_distinct_machine_roles_and_web_destinations() {
+    let ctx = setup().await;
+    ctx.create_conversation("conv_target", "Target", "/work").await;
+    for (id, role, name) in [
+        ("main", "main", "메인 PC"),
+        ("mac", "sub", "MacBook"),
+        ("lab", "sub", "실험 PC"),
+    ] {
+        let mut message = delivery(&format!("conv_{id}"), "conv_target", "remote body");
+        let url = format!("https://{id}.example/#/conversation/conv_{id}");
+        message.from_machine = name.to_owned();
+        message.from_machine_id = Some(id.to_owned());
+        message.from_machine_role = Some(role.to_owned());
+        message.from_conversation_url = Some(url.clone());
+        ctx.service.deliver_remote(USER, message).await.expect("delivered");
+        let source = source_metadata(&ctx.last_user_message_content("conv_target").await);
+        assert_eq!(
+            source,
+            serde_json::json!({
+                "machineId": id, "machineName": name, "machineRole": role, "externalUrl": url,
+            })
+        );
+    }
+}
+
+#[test]
+fn old_relays_remain_compatible_without_navigation_metadata() {
+    let message: RemoteSessionDelivery = serde_json::from_value(serde_json::json!({
+        "fromConversationId": "source", "fromName": "Sender", "to": "target", "message": "body", "fromMachine": "MacBook",
+    })).unwrap();
+    assert!(message.from_machine_id.is_none());
+    assert!(message.from_machine_role.is_none());
+    assert!(message.from_conversation_url.is_none());
 }
 
 #[tokio::test]
